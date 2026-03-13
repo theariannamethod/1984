@@ -1,1 +1,7 @@
 penelope
+penelope_test_bin
+penelope_rs_test
+test/test_penelope_bin
+test/test_penelope_zig
+*.o
+*.bin

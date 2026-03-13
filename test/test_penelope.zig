@@ -1,11 +1,14 @@
 // test_penelope.zig — integration tests for the Zig version of penelope
-// Compiles penelope.zig, runs the binary, and checks output.
+//
+// Usage: cd <repo_root> && zig build-exe penelope.zig -femit-bin=/tmp/penelope_zig_test_bin
+//        zig test test/test_penelope.zig
+//
+// Prerequisite: compile penelope.zig first (the shell test does this).
 
 const std = @import("std");
 const testing = std.testing;
 const Child = std.process.Child;
 
-const penelope_src = "../penelope.zig";
 const penelope_bin = "/tmp/penelope_zig_test_bin";
 const save_path = "/tmp/penelope_zig_test_model.bin";
 
@@ -25,15 +28,12 @@ fn contains(haystack: []const u8, needle: []const u8) bool {
     return std.mem.indexOf(u8, haystack, needle) != null;
 }
 
-test "zig compiles" {
-    const result = try Child.run(.{
-        .allocator = testing.allocator,
-        .argv = &.{ "zig", "build-exe", penelope_src, "-femit-bin=" ++ penelope_bin },
-        .max_output_bytes = 64 * 1024,
-    });
-    defer testing.allocator.free(result.stdout);
-    defer testing.allocator.free(result.stderr);
-    try testing.expect(result.term == .Exited and result.term.Exited == 0);
+test "zig binary exists" {
+    std.fs.accessAbsolute(penelope_bin, .{}) catch {
+        std.debug.print("\n  SKIP: {s} not found. Compile first:\n", .{penelope_bin});
+        std.debug.print("    zig build-exe penelope.zig -femit-bin={s}\n\n", .{penelope_bin});
+        return error.SkipZigTest;
+    };
 }
 
 test "header output" {
@@ -84,22 +84,14 @@ test "prophecy target" {
 }
 
 test "save file size" {
-    // Pipe empty stdin to trigger interactive mode exit, with --save
-    var child = Child.init(&.{ penelope_bin, "--save", save_path }, testing.allocator);
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    try child.spawn();
-    // Close stdin immediately so the program exits
-    child.stdin.?.close();
-    child.stdin = null;
-
-    var stdout: std.ArrayListUnmanaged(u8) = .empty;
-    defer stdout.deinit(testing.allocator);
-    var stderr: std.ArrayListUnmanaged(u8) = .empty;
-    defer stderr.deinit(testing.allocator);
-    try child.collectOutput(testing.allocator, &stdout, &stderr, 256 * 1024);
-    _ = try child.wait();
+    // Run with text + --save to produce a model file
+    const result = try Child.run(.{
+        .allocator = testing.allocator,
+        .argv = &.{ penelope_bin, "--save", save_path, "darkness" },
+        .max_output_bytes = 256 * 1024,
+    });
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
 
     defer std.fs.deleteFileAbsolute(save_path) catch {};
 
