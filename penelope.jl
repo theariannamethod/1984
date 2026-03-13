@@ -243,7 +243,7 @@ const VOCAB = [
 const V = length(VOCAB)  # 1984
 const STEPS = 12
 const D = 384            # embedding dim
-const M_ = 768           # SwiGLU hidden dim (M_ to avoid conflict with Base.M)
+const M = 768            # SwiGLU hidden dim
 
 const VOCAB_SET = Set(VOCAB)
 const VOCAB_IDX = let d = Dict{String,Int}()
@@ -354,17 +354,17 @@ end
 
 function StepWeights()
     scale_d = sqrt(2.0 / D)
-    scale_m = sqrt(2.0 / M_)
+    scale_m = sqrt(2.0 / M)
     wr     = [_randn() * scale_d for _ in 1:(D * D)]
     rms    = ones(Float64, D)
-    w_gate = [_randn() * scale_d for _ in 1:(D * M_)]
-    w_up   = [_randn() * scale_d for _ in 1:(D * M_)]
-    w_down = [_randn() * scale_m for _ in 1:(M_ * D)]
+    w_gate = [_randn() * scale_d for _ in 1:(D * M)]
+    w_up   = [_randn() * scale_d for _ in 1:(D * M)]
+    w_down = [_randn() * scale_m for _ in 1:(M * D)]
     return StepWeights(wr, rms, w_gate, w_up, w_down)
 end
 
 function step_param_count()
-    return D*D + D + D*M_ + D*M_ + M_*D
+    return D*D + D + D*M + D*M + M*D
 end
 
 mutable struct Penelope
@@ -414,10 +414,10 @@ function forward_step(model::Penelope, context_ids::Vector{Int}, step_idx::Int)
     query = rmsnorm(query, sw.rms, D)
 
     # SwiGLU
-    gate = matmul_mv(sw.w_gate, query, M_, D)
-    up = matmul_mv(sw.w_up, query, M_, D)
-    swiglu = [_silu(gate[i]) * up[i] for i in 1:M_]
-    hidden = matmul_mv(sw.w_down, swiglu, D, M_)
+    gate = matmul_mv(sw.w_gate, query, M, D)
+    up = matmul_mv(sw.w_up, query, M, D)
+    swiglu = [_silu(gate[i]) * up[i] for i in 1:M]
+    hidden = matmul_mv(sw.w_down, swiglu, D, M)
 
     # Residual
     out = vadd(query, hidden)
@@ -439,7 +439,7 @@ function save_model(model::Penelope, path::String)
     open(path, "w") do f
         write(f, Int32(V))
         write(f, Int32(D))
-        write(f, Int32(M_))
+        write(f, Int32(M))
         write(f, Int32(STEPS))
         for v in flat
             write(f, Float32(v))
@@ -455,7 +455,7 @@ function load_model!(model::Penelope, path::String)
         d = read(f, Int32)
         m = read(f, Int32)
         st = read(f, Int32)
-        @assert v == V && d == D && m == M_ && st == STEPS "config mismatch: file has V=$v D=$d M=$m S=$st"
+        @assert v == V && d == D && m == M && st == STEPS "config mismatch: file has V=$v D=$d M=$m S=$st"
         total = V * D + STEPS * step_param_count()
         flat = Vector{Float64}(undef, total)
         for i in 1:total
@@ -466,9 +466,9 @@ function load_model!(model::Penelope, path::String)
         for s in model.steps
             s.wr     = flat[o:o + D*D - 1]; o += D*D
             s.rms    = flat[o:o + D - 1]; o += D
-            s.w_gate = flat[o:o + D*M_ - 1]; o += D*M_
-            s.w_up   = flat[o:o + D*M_ - 1]; o += D*M_
-            s.w_down = flat[o:o + M_*D - 1]; o += M_*D
+            s.w_gate = flat[o:o + D*M - 1]; o += D*M
+            s.w_up   = flat[o:o + D*M - 1]; o += D*M
+            s.w_down = flat[o:o + M*D - 1]; o += M*D
         end
     end
     println("  loaded $path")
@@ -565,10 +565,10 @@ function train!(model::Penelope, data_path::String, steps::Int=5000, lr::Float64
             # reconstruct forward
             query = matmul_mv(sw.wr, ctx, D, D)
             query_n = rmsnorm(query, sw.rms, D)
-            gate = matmul_mv(sw.w_gate, query_n, M_, D)
-            up = matmul_mv(sw.w_up, query_n, M_, D)
-            swiglu = [_silu(gate[i]) * up[i] for i in 1:M_]
-            hidden = matmul_mv(sw.w_down, swiglu, D, M_)
+            gate = matmul_mv(sw.w_gate, query_n, M, D)
+            up = matmul_mv(sw.w_up, query_n, M, D)
+            swiglu = [_silu(gate[i]) * up[i] for i in 1:M]
+            hidden = matmul_mv(sw.w_down, swiglu, D, M)
             out = vadd(query_n, hidden)
 
             # d_out from tied weights
@@ -598,15 +598,15 @@ function train!(model::Penelope, data_path::String, steps::Int=5000, lr::Float64
             d_hidden = copy(d_out)
 
             # backprop through w_down
-            d_swiglu = matmul_mtv(sw.w_down, d_hidden, D, M_)
-            for i in 1:M_
+            d_swiglu = matmul_mtv(sw.w_down, d_hidden, D, M)
+            for i in 1:M
                 for j in 1:D
                     sw.w_down[(i - 1) * D + j] -= lr * swiglu[i] * d_hidden[j]
                 end
             end
 
             # backprop through SwiGLU
-            for i in 1:M_
+            for i in 1:M
                 sg = _silu(gate[i])
                 sig = gate[i] > -20.0 ? 1.0 / (1.0 + exp(-gate[i])) : 0.0
                 silu_grad = gate[i] > -20.0 ? sig * (1.0 + gate[i] * (1.0 - sig)) : 0.0
@@ -621,8 +621,8 @@ function train!(model::Penelope, data_path::String, steps::Int=5000, lr::Float64
 
             # d_query_n
             d_qn = copy(d_out)
-            d_qn_gate_input = Vector{Float64}(undef, M_)
-            for i in 1:M_
+            d_qn_gate_input = Vector{Float64}(undef, M)
+            for i in 1:M
                 g = gate[i]
                 if g > -20.0
                     sig = 1.0 / (1.0 + exp(-g))
@@ -631,8 +631,8 @@ function train!(model::Penelope, data_path::String, steps::Int=5000, lr::Float64
                     d_qn_gate_input[i] = 0.0
                 end
             end
-            d_qn_gate = matmul_mtv(sw.w_gate, d_qn_gate_input, M_, D)
-            d_qn_up = matmul_mtv(sw.w_up, [d_swiglu[i] * _silu(gate[i]) for i in 1:M_], M_, D)
+            d_qn_gate = matmul_mtv(sw.w_gate, d_qn_gate_input, M, D)
+            d_qn_up = matmul_mtv(sw.w_up, [d_swiglu[i] * _silu(gate[i]) for i in 1:M], M, D)
             d_qn = vadd(d_qn, vadd(d_qn_gate, d_qn_up))
 
             # approx RMSNorm backward
