@@ -494,8 +494,17 @@ static int compile_c(const char *c_code, size_t c_len,
     }
     close(fd);
 
-    /* build cc command */
+    /* build cc command — sanitize paths to prevent injection */
     char cmd[4096];
+    /* validate output and tmp_path contain no shell metacharacters */
+    for (const char *p = output; *p; p++) {
+        if (*p == '\'' || *p == '\\' || *p == '$' || *p == '`'
+            || *p == '(' || *p == ')' || *p == ';' || *p == '&'
+            || *p == '|' || *p == '\n') {
+            fprintf(stderr, "amlc: unsafe character in output path\n");
+            return -1;
+        }
+    }
     snprintf(cmd, sizeof(cmd), "cc -O2 -o '%s' '%s' -lm 2>&1", output, tmp_path);
 
     fprintf(stderr, "amlc: compiling → %s\n", output);
