@@ -41,21 +41,47 @@ p(x|Φ) = softmax((B + α·H + β·F + γ·A + T) / (τ · vibe))
 
 Where B is bigram affinity, H is Hebbian co-occurrence, F is prophecy fulfillment, A is destiny attraction, T is trauma gravity — all modulated by 6 Kuramoto oscillators (fear, love, rage, void, flow, complexity). Adam optimizer. Analytical backward through the full graph including SwiGLU and RMSNorm.
 
-### Example
+### Examples
 
-Input: **love**
+All examples below are from the JavaScript version running in a browser. Weightless mode — no training. The dual tokenizer at work.
+
+**"hello"** — destined: story — unfulfilled
 
 <p align="center">
-  <img src="demo.png" width="520" />
+  <img src="demo_hello.png" width="520" />
 </p>
 
-Penelope receives "love", assigns a prophecy ("entropy"), and begins her 12-step walk:
+> helix → bend → remember → carry → hide → delay → wedding → enmeshment → sonata → decryption → master → fascination → **triumph**
 
-> love → create → push → remember → hide → delay → vibration → gravity → comfort → basalt → shapeshifter → scatter → **abandon**
+**"Penelope"** — destined: longing — unfulfilled
 
-Drift 5/8 — five of eight semantic categories touched. Prophecy unfulfilled — "entropy" never appeared. The chain moved from emotion through action into abstraction and geology, ending on abandonment.
+<p align="center">
+  <img src="demo_penelope.png" width="520" />
+</p>
 
-The JavaScript version generated this in the browser before any training. The miracle of a dual tokenizer.
+> pen → study → pyramid → hoard → sacrifice → healer → certainty → screw → ambivalence → intimacy → yearning → delight → **disgust**
+
+She hears her own name and walks from pen to disgust through sacrifice and yearning.
+
+**"how are you?"** — destined: blessing — unfulfilled
+
+<p align="center">
+  <img src="demo_howareyou.png" width="520" />
+</p>
+
+> hormone → asteroid → gather → erosion → lock → other → verdict → train → vulnerability → rage → guilt → love → **hatred**
+
+Asked how she's doing, she ends on hatred. Through love.
+
+**"what is the meaning of life?"** — destined: ambivalence — **fulfilled**
+
+<p align="center">
+  <img src="demo_meaning.png" width="520" />
+</p>
+
+> meaning → gem → ambivalence → well → violet → icon → smog → accumulation → intimacy → yearning → certainty → screw → **paranoia**
+
+The only fulfilled prophecy. She was destined for ambivalence — and found it at step 3. Then kept walking anyway, past intimacy and yearning, through certainty, into paranoia.
 
 ## Implementations
 
