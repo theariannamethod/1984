@@ -2,7 +2,7 @@
 //
 // Trainable resonance engine in Rust. Not a transformer. A mirror that learns.
 //
-// Input:  text → vocab word IDs (prefix matching)
+// Input:  text → vocab word IDs (BPE: exact + stem + greedy vocab decomposition)
 // Attend: RRPRAM resonance + SwiGLU per step (how it thinks)
 // Output: word-level from 1984 vocab (gibberish impossible)
 //
@@ -516,20 +516,96 @@ fn is_stop(w: &str) -> bool {
     STOPS.contains(&w)
 }
 
+const SUFFIXES: [&str; 38] = [
+    "ting","ning","ring","ling","ding","ping","bing","ging","ming","king",
+    "sing","zing",
+    "ing","ment","ness","tion","sion","able","ible","ence","ance",
+    "eous","ious","ful","less","ize","ise","ous","ive","ity",
+    "ly","er","ed","est","al","en","es","s",
+];
+
+/// Strip suffix, try exact match on stem, stem+"e", or doubled-consonant removal.
+fn try_stem(word: &str, idx: &HashMap<String, usize>) -> Option<usize> {
+    let wlen = word.len();
+    for &suffix in &SUFFIXES {
+        let slen = suffix.len();
+        if wlen <= slen + 2 { continue; }
+        if !word.ends_with(suffix) { continue; }
+        let sl = wlen - slen;
+        let stem = &word[..sl];
+
+        // exact stem
+        if let Some(&i) = idx.get(stem) { return Some(i); }
+
+        // stem + 'e' (creat→create, danc→dance)
+        let mut stem_e = String::with_capacity(sl + 1);
+        stem_e.push_str(stem);
+        stem_e.push('e');
+        if let Some(&i) = idx.get(stem_e.as_str()) { return Some(i); }
+
+        // doubled consonant (runn→run, swimm→swim)
+        let stem_bytes = stem.as_bytes();
+        if sl >= 3 && stem_bytes[sl - 1] == stem_bytes[sl - 2] {
+            let shortened = &stem[..sl - 1];
+            if let Some(&i) = idx.get(shortened) { return Some(i); }
+        }
+    }
+    None
+}
+
+/// Greedy longest vocab match within a word (BPE decomposition).
+fn greedy_vocab_match(word: &str, idx: &HashMap<String, usize>) -> Vec<usize> {
+    let mut ids = Vec::new();
+    let wlen = word.len();
+    let mut pos = 0;
+    while pos < wlen && ids.len() < 8 {
+        let mut best: Option<usize> = None;
+        let mut best_len = 0usize;
+        for (vw, &vi) in idx.iter() {
+            let vl = vw.len();
+            if vl <= best_len || vl > wlen - pos { continue; }
+            if word[pos..].starts_with(vw.as_str()) {
+                best = Some(vi);
+                best_len = vl;
+            }
+        }
+        if let Some(b) = best {
+            if best_len >= 3 {
+                ids.push(b);
+                pos += best_len;
+            } else {
+                pos += 1;
+            }
+        } else {
+            pos += 1;
+        }
+    }
+    ids
+}
+
 fn tokenize_text(text: &str, idx: &HashMap<String, usize>) -> Vec<usize> {
     let mut ids = Vec::new();
     for word in text.to_lowercase().split(|c: char| !c.is_alphabetic()) {
         if word.len() < 2 || is_stop(word) { continue; }
+
+        // 1. exact vocab match
         if let Some(&i) = idx.get(word) {
             ids.push(i);
-        } else {
-            let mut best = None;
-            let mut best_len = 0usize;
-            for (&ref vw, &vi) in idx.iter() {
-                let plen = word.chars().zip(vw.chars()).take_while(|(a,b)| a == b).count();
-                if plen > best_len { best_len = plen; best = Some(vi); }
+            continue;
+        }
+
+        // 2. stem + match
+        if let Some(i) = try_stem(word, idx) {
+            ids.push(i);
+            continue;
+        }
+
+        // 3. greedy longest vocab match (BPE decomposition)
+        let subs = greedy_vocab_match(word, idx);
+        for &s in &subs {
+            if ids.is_empty() || *ids.last().unwrap() != s {
+                ids.push(s);
             }
-            if best_len >= 3 { if let Some(b) = best { ids.push(b); } }
         }
     }
     ids

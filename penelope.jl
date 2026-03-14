@@ -1,5 +1,6 @@
 # penelope.jl — 1984 words. 12 steps of resonance. Dario Equation.
 # Julia version. Single file. No dependencies.
+# BPE input tokenizer: exact → stem → greedy decomposition.
 # By Arianna Method. הרזוננס לא נשבר
 
 using Printf
@@ -476,8 +477,88 @@ end
 
 
 # ═══════════════════════════════════════════════════════════════
-# TOKENIZER — map arbitrary text to word IDs in our 1984 vocab
+# BPE INPUT — stem + greedy longest vocab match
+#
+# Three-stage tokenizer for arbitrary text:
+#   1. Exact vocab match     ("fire" → fire)
+#   2. Suffix stripping       ("burning" → burn, "created" → create)
+#   3. Greedy decomposition   ("heartbreak" → heart + break)
+#
+# The 1984 vocab words ARE the BPE token vocabulary.
+# Greedy longest-match IS BPE encoding.
 # ═══════════════════════════════════════════════════════════════
+
+const SUFFIXES = [
+    "ting","ning","ring","ling","ding","ping","bing","ging","ming","king",
+    "sing","zing",
+    "ing","ment","ness","tion","sion","able","ible","ence","ance",
+    "eous","ious","ful","less","ize","ise","ous","ive","ity",
+    "ly","er","ed","est","al","en","es","s",
+]
+
+const VOCAB_LENS = [length(w) for w in VOCAB]
+
+"""
+    try_stem(word) → Int or nothing
+
+Strip English suffix, try exact match, then stem+"e", then doubled consonant removal.
+Returns 0-based vocab index or nothing.
+"""
+function try_stem(word::AbstractString)
+    wlen = length(word)
+    for suf in SUFFIXES
+        slen = length(suf)
+        slen + 2 >= wlen && continue
+        endswith(word, suf) || continue
+        sl = wlen - slen
+        stem = word[1:sl]
+        idx = get(VOCAB_IDX, stem, nothing)
+        idx !== nothing && return idx
+        # stem + 'e' (creat→create, danc→dance)
+        stem_e = stem * "e"
+        idx = get(VOCAB_IDX, stem_e, nothing)
+        idx !== nothing && return idx
+        # doubled consonant (runn→run, swimm→swim)
+        if sl >= 3 && stem[sl] == stem[sl-1]
+            stem_dd = stem[1:sl-1]
+            idx = get(VOCAB_IDX, stem_dd, nothing)
+            idx !== nothing && return idx
+        end
+    end
+    return nothing
+end
+
+"""
+    greedy_vocab_match(word) → Vector{Int}
+
+Greedy longest vocab match within a word. Returns 0-based vocab indices.
+Skips matches shorter than 3 characters.
+"""
+function greedy_vocab_match(word::AbstractString)
+    ids = Int[]
+    wlen = length(word)
+    pos = 1  # 1-based position in word
+    while pos <= wlen && length(ids) < 8
+        best_idx = -1
+        best_len = 0
+        for v in 1:V
+            vl = VOCAB_LENS[v]
+            vl <= best_len && continue
+            vl > wlen - pos + 1 && continue
+            if word[pos:pos+vl-1] == VOCAB[v]
+                best_idx = v - 1  # 0-based
+                best_len = vl
+            end
+        end
+        if best_idx >= 0 && best_len >= 3
+            push!(ids, best_idx)
+            pos += best_len
+        else
+            pos += 1
+        end
+    end
+    return ids
+end
 
 function tokenize_text(text::String)
     words = [m.match for m in eachmatch(r"[a-z]+", lowercase(text))]
@@ -486,29 +567,26 @@ function tokenize_text(text::String)
         if w in STOP || length(w) < 2
             continue
         end
-        if haskey(VOCAB_IDX, w)
-            push!(ids, VOCAB_IDX[w])
-        else
-            # prefix match
-            best = -1
-            best_len = 0
-            for (vw, vi) in VOCAB_IDX
-                ml = min(length(w), length(vw))
-                plen = 0
-                for k in 1:ml
-                    if w[k] == vw[k]
-                        plen += 1
-                    else
-                        break
-                    end
-                end
-                if plen > best_len
-                    best_len = plen
-                    best = vi
-                end
-            end
-            if best >= 0 && best_len >= 3
-                push!(ids, best)
+
+        # 1. exact vocab match
+        idx = get(VOCAB_IDX, w, nothing)
+        if idx !== nothing
+            push!(ids, idx)
+            continue
+        end
+
+        # 2. stem + match
+        idx = try_stem(w)
+        if idx !== nothing
+            push!(ids, idx)
+            continue
+        end
+
+        # 3. greedy longest vocab match (BPE decomposition)
+        sub = greedy_vocab_match(w)
+        for s in sub
+            if isempty(ids) || ids[end] != s
+                push!(ids, s)
             end
         end
     end

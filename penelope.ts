@@ -2,7 +2,7 @@
 //
 // Trainable resonance engine. Not a transformer. A mirror that learns.
 //
-// Input:  text → vocab word IDs (prefix matching)
+// Input:  text → vocab word IDs (BPE: exact + stem + greedy vocab decomposition)
 // Attend: RRPRAM resonance + SwiGLU per step (how it thinks)
 // Output: word-level from 1984 vocab (gibberish impossible)
 //
@@ -535,33 +535,92 @@ class Penelope {
 
 
 // ═══════════════════════════════════════════════════════════════
-// TOKENIZER — map arbitrary text to word IDs in our 1984 vocab
+// BPE INPUT — stem + greedy longest vocab match
+//
+// Three-stage tokenizer for arbitrary text:
+//   1. Exact vocab match     ("fire" → fire)
+//   2. Suffix stripping       ("burning" → burn, "created" → create)
+//   3. Greedy decomposition   ("heartbreak" → heart + break)
+//
+// The 1984 vocab words ARE the BPE token vocabulary.
+// Greedy longest-match IS BPE encoding.
 // ═══════════════════════════════════════════════════════════════
+
+/* precomputed vocab word lengths for greedy match */
+const vocabLen: number[] = VOCAB.map(w => w.length);
+
+const SUFFIXES: string[] = [
+  "ting","ning","ring","ling","ding","ping","bing","ging","ming","king",
+  "sing","zing",
+  "ing","ment","ness","tion","sion","able","ible","ence","ance",
+  "eous","ious","ful","less","ize","ise","ous","ive","ity",
+  "ly","er","ed","est","al","en","es","s",
+];
+
+function tryStem(word: string): number {
+  const wlen = word.length;
+  for (const suffix of SUFFIXES) {
+    const slen = suffix.length;
+    if (wlen <= slen + 2) continue;
+    if (!word.endsWith(suffix)) continue;
+    const stem = word.slice(0, wlen - slen);
+    let idx = VOCAB_IDX.get(stem);
+    if (idx !== undefined) return idx;
+    /* stem + 'e' (creat→create, danc→dance) */
+    idx = VOCAB_IDX.get(stem + "e");
+    if (idx !== undefined) return idx;
+    /* doubled consonant (runn→run, swimm→swim) */
+    if (stem.length >= 3 && stem[stem.length - 1] === stem[stem.length - 2]) {
+      idx = VOCAB_IDX.get(stem.slice(0, -1));
+      if (idx !== undefined) return idx;
+    }
+  }
+  return -1;
+}
+
+function greedyVocabMatch(word: string, wlen: number, maxIds: number): number[] {
+  const ids: number[] = [];
+  let pos = 0;
+  while (pos < wlen && ids.length < maxIds) {
+    let best = -1;
+    let bestLen = 0;
+    for (let v = 0; v < V; v++) {
+      const vl = vocabLen[v];
+      if (vl <= bestLen || vl > wlen - pos) continue;
+      if (word.startsWith(VOCAB[v], pos)) {
+        best = v;
+        bestLen = vl;
+      }
+    }
+    if (best >= 0 && bestLen >= 3) {
+      ids.push(best);
+      pos += bestLen;
+    } else {
+      pos++;
+    }
+  }
+  return ids;
+}
 
 function tokenize_text(text: string): number[] {
   const words = text.toLowerCase().match(/[a-z]+/g) || [];
   const ids: number[] = [];
   for (const w of words) {
-    if (STOP.has(w) || w.length < 2) continue;
-    if (VOCAB_IDX.has(w)) {
-      ids.push(VOCAB_IDX.get(w)!);
-    } else {
-      let best = -1;
-      let bestLen = 0;
-      for (const [vw, vi] of VOCAB_IDX) {
-        const ml = Math.min(w.length, vw.length);
-        let plen = 0;
-        for (let k = 0; k < ml; k++) {
-          if (w[k] === vw[k]) plen++;
-          else break;
-        }
-        if (plen > bestLen) {
-          bestLen = plen;
-          best = vi;
-        }
-      }
-      if (best >= 0 && bestLen >= 3) {
-        ids.push(best);
+    if (w.length < 2 || STOP.has(w)) continue;
+
+    /* 1. exact vocab match */
+    const exact = VOCAB_IDX.get(w);
+    if (exact !== undefined) { ids.push(exact); continue; }
+
+    /* 2. stem + match */
+    const stemIdx = tryStem(w);
+    if (stemIdx >= 0) { ids.push(stemIdx); continue; }
+
+    /* 3. greedy longest vocab match (BPE decomposition) */
+    const sub = greedyVocabMatch(w, w.length, 8);
+    for (const s of sub) {
+      if (ids.length === 0 || ids[ids.length - 1] !== s) {
+        ids.push(s);
       }
     }
   }

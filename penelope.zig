@@ -1,6 +1,7 @@
 // penelope.zig — 1984 words. 12 steps of resonance. Dario Equation.
 //
 // Faithful port of penelope.c to Zig 0.15.2.
+// BPE input tokenizer: exact match → suffix stemming → greedy decomposition.
 // By Arianna Method. הרזוננס לא נשבר
 
 const std = @import("std");
@@ -965,6 +966,94 @@ fn isDelimiter(c: u8) bool {
     };
 }
 
+// ═══════════════════════════════════════════════════════════════
+// BPE INPUT — stem + greedy longest vocab match
+//
+// Three-stage tokenizer for arbitrary text:
+//   1. Exact vocab match     ("fire" → fire)
+//   2. Suffix stripping       ("burning" → burn, "created" → create)
+//   3. Greedy decomposition   ("heartbreak" → heart + break)
+//
+// The 1984 vocab words ARE the BPE token vocabulary.
+// Greedy longest-match IS BPE encoding.
+// ═══════════════════════════════════════════════════════════════
+
+const SUFFIXES = [_][]const u8{
+    "ting", "ning", "ring", "ling", "ding", "ping", "bing", "ging", "ming", "king",
+    "sing", "zing",
+    "ing",  "ment", "ness", "tion", "sion", "able", "ible", "ence", "ance",
+    "eous", "ious", "ful",  "less", "ize",  "ise",  "ous",  "ive",  "ity",
+    "ly",   "er",   "ed",   "est",  "al",   "en",   "es",   "s",
+};
+
+/// Precomputed vocab word lengths for greedy match.
+const vocab_lens = blk: {
+    var lens: [NWORDS]usize = undefined;
+    for (0..NWORDS) |i| {
+        lens[i] = VOCAB[i].len;
+    }
+    break :blk lens;
+};
+
+/// Try stripping an English suffix and matching the stem in VOCAB.
+/// Returns vocab index or -1 on failure.
+fn tryStem(word: []const u8) i32 {
+    var stem_buf: [64]u8 = undefined;
+    const wlen = word.len;
+
+    for (SUFFIXES) |suffix| {
+        const slen = suffix.len;
+        if (wlen <= slen + 2) continue;
+        if (!std.mem.eql(u8, word[wlen - slen ..], suffix)) continue;
+
+        const sl = wlen - slen;
+        @memcpy(stem_buf[0..sl], word[0..sl]);
+
+        // exact stem
+        const idx = findWord(stem_buf[0..sl]);
+        if (idx >= 0) return idx;
+
+        // stem + 'e' (creat→create, danc→dance)
+        stem_buf[sl] = 'e';
+        const idx_e = findWord(stem_buf[0 .. sl + 1]);
+        if (idx_e >= 0) return idx_e;
+
+        // doubled consonant (runn→run, swimm→swim)
+        if (sl >= 3 and stem_buf[sl - 1] == stem_buf[sl - 2]) {
+            const idx_d = findWord(stem_buf[0 .. sl - 1]);
+            if (idx_d >= 0) return idx_d;
+        }
+    }
+    return -1;
+}
+
+/// Greedy longest vocab match within a word (BPE decomposition).
+/// Returns number of token ids written.
+fn greedyVocabMatch(word: []const u8, ids: []i32) usize {
+    var n: usize = 0;
+    var pos: usize = 0;
+    while (pos < word.len and n < ids.len) {
+        var best: i32 = -1;
+        var best_len: usize = 0;
+        for (0..NWORDS) |v| {
+            const vl = vocab_lens[v];
+            if (vl <= best_len or vl > word.len - pos) continue;
+            if (std.mem.eql(u8, word[pos .. pos + vl], VOCAB[v])) {
+                best = @intCast(v);
+                best_len = vl;
+            }
+        }
+        if (best >= 0 and best_len >= 3) {
+            ids[n] = best;
+            n += 1;
+            pos += best_len;
+        } else {
+            pos += 1;
+        }
+    }
+    return n;
+}
+
 fn tokenizeText(text: []const u8, ids: []i32) usize {
     var buf: [4096]u8 = undefined;
     var bi: usize = 0;
@@ -978,40 +1067,40 @@ fn tokenizeText(text: []const u8, ids: []i32) usize {
     var n: usize = 0;
     var i: usize = 0;
     while (i < input.len and n < ids.len) {
-        // skip delimiters
-        while (i < input.len and isDelimiter(input[i])) : (i += 1) {}
+        // skip non-alpha
+        while (i < input.len and !std.ascii.isAlphabetic(input[i])) : (i += 1) {}
         if (i >= input.len) break;
-        // find end of token
+
+        // extract word
         const tok_start = i;
-        while (i < input.len and !isDelimiter(input[i])) : (i += 1) {}
-        const tok = input[tok_start..i];
+        while (i < input.len and std.ascii.isAlphabetic(input[i])) : (i += 1) {}
+        const word = input[tok_start..i];
 
-        if (tok.len < 2 or isStop(tok)) continue;
+        if (word.len < 2 or isStop(word)) continue;
 
-        const idx = findWord(tok);
+        // 1. exact vocab match
+        const idx = findWord(word);
         if (idx >= 0) {
             ids[n] = idx;
             n += 1;
-        } else {
-            // prefix match
-            var best: i32 = -1;
-            var best_len: usize = 0;
-            for (0..NWORDS) |vi| {
-                const vocab_word = VOCAB[vi];
-                const mn = @min(vocab_word.len, tok.len);
-                var plen: usize = 0;
-                for (0..mn) |j| {
-                    if (vocab_word[j] == tok[j]) {
-                        plen += 1;
-                    } else break;
-                }
-                if (plen > best_len) {
-                    best_len = plen;
-                    best = @intCast(vi);
-                }
-            }
-            if (best >= 0 and best_len >= 3) {
-                ids[n] = best;
+            continue;
+        }
+
+        // 2. stem + match
+        const stem_idx = tryStem(word);
+        if (stem_idx >= 0) {
+            ids[n] = stem_idx;
+            n += 1;
+            continue;
+        }
+
+        // 3. greedy longest vocab match (BPE decomposition)
+        var sub: [8]i32 = undefined;
+        const ns = greedyVocabMatch(word, &sub);
+        for (sub[0..ns]) |sid| {
+            if (n >= ids.len) break;
+            if (n == 0 or ids[n - 1] != sid) {
+                ids[n] = sid;
                 n += 1;
             }
         }

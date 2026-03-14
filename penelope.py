@@ -4,7 +4,7 @@ penelope.py — 1984 words. 12 steps of resonance. Dario Equation.
 
 Trainable resonance engine. Not a transformer. A mirror that learns.
 
-Input:  subword BPE (reads arbitrary text with nuance)
+Input:  text → vocab word IDs (BPE: exact + stem + greedy vocab decomposition)
 Attend: RRPRAM resonance + SwiGLU per step (how it thinks)
 Output: word-level from 1984 vocab (gibberish impossible)
 
@@ -470,33 +470,94 @@ class Penelope:
 
 
 # ═══════════════════════════════════════════════════════════════
-# TOKENIZER — map arbitrary text to word IDs in our 1984 vocab
+# BPE INPUT — stem + greedy longest vocab match
+#
+# Three-stage tokenizer for arbitrary text:
+#   1. Exact vocab match     ("fire" → fire)
+#   2. Suffix stripping       ("burning" → burn, "created" → create)
+#   3. Greedy decomposition   ("heartbreak" → heart + break)
+#
+# The 1984 vocab words ARE the BPE token vocabulary.
+# Greedy longest-match IS BPE encoding.
 # ═══════════════════════════════════════════════════════════════
 
+SUFFIXES = [
+    "ting","ning","ring","ling","ding","ping","bing","ging","ming","king",
+    "sing","zing",
+    "ing","ment","ness","tion","sion","able","ible","ence","ance",
+    "eous","ious","ful","less","ize","ise","ous","ive","ity",
+    "ly","er","ed","est","al","en","es","s",
+]
+
+VOCAB_LENS = [len(w) for w in VOCAB]
+
+
+def try_stem(word):
+    """Strip suffix, try exact match, stem+'e', doubled consonant removal."""
+    wlen = len(word)
+    for sfx in SUFFIXES:
+        slen = len(sfx)
+        if wlen <= slen + 2:
+            continue
+        if not word.endswith(sfx):
+            continue
+        stem = word[:wlen - slen]
+        # exact stem
+        if stem in VOCAB_IDX:
+            return VOCAB_IDX[stem]
+        # stem + 'e' (creat→create, danc→dance)
+        stem_e = stem + "e"
+        if stem_e in VOCAB_IDX:
+            return VOCAB_IDX[stem_e]
+        # doubled consonant (runn→run, swimm→swim)
+        if len(stem) >= 3 and stem[-1] == stem[-2]:
+            stem_short = stem[:-1]
+            if stem_short in VOCAB_IDX:
+                return VOCAB_IDX[stem_short]
+    return -1
+
+
+def greedy_vocab_match(word):
+    """Greedy longest vocab match within a word. Returns list of IDs."""
+    ids = []
+    pos = 0
+    wlen = len(word)
+    while pos < wlen:
+        best, best_len = -1, 0
+        for v in range(V):
+            vl = VOCAB_LENS[v]
+            if vl <= best_len or vl > wlen - pos:
+                continue
+            if word[pos:pos + vl] == VOCAB[v]:
+                best, best_len = v, vl
+        if best >= 0 and best_len >= 3:
+            ids.append(best)
+            pos += best_len
+        else:
+            pos += 1
+    return ids
+
+
 def tokenize_text(text):
-    """Extract vocab words from text. Words not in vocab → nearest match."""
+    """Three-stage BPE: exact → stem → greedy vocab decomposition."""
     words = re.findall(r"[a-z]+", text.lower())
     ids = []
     for w in words:
-        if w in STOP or len(w) < 2:
+        if len(w) < 2 or w in STOP:
             continue
+        # 1. exact vocab match
         if w in VOCAB_IDX:
             ids.append(VOCAB_IDX[w])
-        else:
-            # prefix match
-            best, best_len = -1, 0
-            for vw, vi in VOCAB_IDX.items():
-                ml = min(len(w), len(vw))
-                plen = 0
-                for k in range(ml):
-                    if w[k] == vw[k]:
-                        plen += 1
-                    else:
-                        break
-                if plen > best_len:
-                    best_len, best = plen, vi
-            if best >= 0 and best_len >= 3:
-                ids.append(best)
+            continue
+        # 2. stem + match
+        idx = try_stem(w)
+        if idx >= 0:
+            ids.append(idx)
+            continue
+        # 3. greedy longest vocab match (BPE decomposition)
+        for sub_id in greedy_vocab_match(w):
+            if not ids or ids[-1] != sub_id:
+                ids.append(sub_id)
     return ids
 
 

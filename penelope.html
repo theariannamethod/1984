@@ -472,6 +472,105 @@ const VOCAB = [
 const STOP = new Set("i me my we our you your he she it they them the a an and or but in on at to for of is am are was were be been being have has had do does did will would shall should can could may might must not no nor so if then than that this these those what which who whom how when where why all each every some any few many much more most other another such".split(" "));
 
 // ═══════════════════════════════════════════════════════════════
+// BPE INPUT — stem + greedy longest vocab match
+//
+// Three-stage tokenizer for arbitrary text:
+//   1. Exact vocab match     ("fire" → fire)
+//   2. Suffix stripping       ("burning" → burn, "created" → create)
+//   3. Greedy decomposition   ("heartbreak" → heart + break)
+//
+// The 1984 vocab words ARE the BPE token vocabulary.
+// Greedy longest-match IS BPE encoding.
+// ═══════════════════════════════════════════════════════════════
+
+const SUFFIXES = [
+  "ting","ning","ring","ling","ding","ping","bing","ging","ming","king",
+  "sing","zing",
+  "ing","ment","ness","tion","sion","able","ible","ence","ance",
+  "eous","ious","ful","less","ize","ise","ous","ive","ity",
+  "ly","er","ed","est","al","en","es","s"
+];
+
+const VOCAB_LENS = VOCAB.map(w => w.length);
+
+function tryStem(word) {
+  const wlen = word.length;
+  for (const suffix of SUFFIXES) {
+    const slen = suffix.length;
+    if (wlen <= slen + 2) continue;
+    if (!word.endsWith(suffix)) continue;
+    const stem = word.slice(0, wlen - slen);
+    // exact stem
+    let idx = VOCAB.indexOf(stem);
+    if (idx >= 0) return idx;
+    // stem + 'e' (creat→create, danc→dance)
+    idx = VOCAB.indexOf(stem + 'e');
+    if (idx >= 0) return idx;
+    // doubled consonant (runn→run, swimm→swim)
+    if (stem.length >= 3 && stem[stem.length - 1] === stem[stem.length - 2]) {
+      idx = VOCAB.indexOf(stem.slice(0, -1));
+      if (idx >= 0) return idx;
+    }
+  }
+  return -1;
+}
+
+function greedyVocabMatch(word) {
+  const wlen = word.length;
+  const ids = [];
+  let pos = 0;
+  while (pos < wlen && ids.length < 8) {
+    let best = -1, bestLen = 0;
+    for (let v = 0; v < VOCAB.length; v++) {
+      const vl = VOCAB_LENS[v];
+      if (vl <= bestLen || vl > wlen - pos) continue;
+      if (word.startsWith(VOCAB[v], pos)) {
+        best = v;
+        bestLen = vl;
+      }
+    }
+    if (best >= 0 && bestLen >= 3) {
+      ids.push(best);
+      pos += bestLen;
+    } else {
+      pos++;
+    }
+  }
+  return ids;
+}
+
+function tokenizeText(text) {
+  const lower = text.toLowerCase();
+  const ids = [];
+  let pos = 0;
+  while (pos < lower.length) {
+    // skip non-alpha
+    while (pos < lower.length && !/[a-z]/.test(lower[pos])) pos++;
+    if (pos >= lower.length) break;
+    // extract word
+    let wl = 0;
+    const start = pos;
+    while (pos < lower.length && /[a-z]/.test(lower[pos])) { pos++; wl++; }
+    const word = lower.slice(start, start + wl);
+    if (wl < 2 || STOP.has(word)) continue;
+    // 1. exact vocab match
+    let idx = VOCAB.indexOf(word);
+    if (idx >= 0) { ids.push(idx); continue; }
+    // 2. stem + match
+    idx = tryStem(word);
+    if (idx >= 0) { ids.push(idx); continue; }
+    // 3. greedy longest vocab match (BPE decomposition)
+    const sub = greedyVocabMatch(word);
+    for (const s of sub) {
+      if (ids.length === 0 || ids[ids.length - 1] !== s) {
+        ids.push(s);
+      }
+    }
+  }
+  return ids;
+}
+
+// ═══════════════════════════════════════════════════════════════
 // DARIO FIELD — co-occurrence, prophecy, destiny, trauma
 // ═══════════════════════════════════════════════════════════════
 
@@ -647,15 +746,16 @@ function selectWord(context, prevWord, stepIdx, forbidden) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// EXTRACT KEY WORD — find the soul of the input
+// EXTRACT KEY WORD — BPE tokenize input, return best vocab word
 // ═══════════════════════════════════════════════════════════════
 
 function extractKey(text) {
+  const ids = tokenizeText(text);
+  if (ids.length > 0) return VOCAB[ids[0]];
+  // fallback: longest non-stop word
   const words = text.toLowerCase().replace(/[^a-z\s]/g, '').split(/\s+/).filter(w => w.length > 1 && !STOP.has(w));
   if (words.length === 0) return text.toLowerCase().split(/\s+/)[0] || "silence";
-
-  // prefer longest non-stop word, with tie-break by position (later = more important)
-  words.sort((a, b) => b.length - a.length || words.indexOf(b) - words.indexOf(a));
+  words.sort((a, b) => b.length - a.length);
   return words[0];
 }
 
@@ -694,27 +794,37 @@ async function runChain(userText) {
   prophecyEl.classList.remove('visible');
   if (waiting) waiting.style.display = 'none';
 
-  // extract seed
-  const keyWord = extractKey(userText);
+  // BPE tokenize input — three-stage: exact → stem → greedy decomposition
+  const inputIds = tokenizeText(userText);
   const inputWords = new Set(userText.toLowerCase().replace(/[^a-z\s]/g,'').split(/\s+/));
 
-  // find closest vocab word to seed
-  let seed = keyWord;
-  if (!VOCAB.includes(seed)) {
-    // find by substring or phonetic proximity
-    let best = null, bestScore = -1;
-    for (const w of VOCAB) {
-      let score = 0;
-      if (w.includes(seed) || seed.includes(w)) score = 3;
-      // shared prefix
-      for (let i = 0; i < Math.min(w.length, seed.length); i++) {
-        if (w[i] === seed[i]) score += 0.5;
-        else break;
+  // seed = first BPE token, or fallback
+  let seed;
+  if (inputIds.length > 0) {
+    seed = VOCAB[inputIds[0]];
+  } else {
+    // last resort: substring/prefix match
+    const keyWord = extractKey(userText);
+    seed = keyWord;
+    if (!VOCAB.includes(seed)) {
+      let best = null, bestScore = -1;
+      for (const w of VOCAB) {
+        let score = 0;
+        if (w.includes(seed) || seed.includes(w)) score = 3;
+        for (let i = 0; i < Math.min(w.length, seed.length); i++) {
+          if (w[i] === seed[i]) score += 0.5;
+          else break;
+        }
+        if (score > bestScore) { bestScore = score; best = w; }
       }
-      if (score > bestScore) { bestScore = score; best = w; }
+      if (best && bestScore > 0) seed = best;
+      else seed = VOCAB[Math.floor(Math.random() * 200)];
     }
-    if (best && bestScore > 0) seed = best;
-    else seed = VOCAB[Math.floor(Math.random() * 200)]; // fallback to nature/body
+  }
+
+  // prime Hebbian field with all input tokens
+  for (let i = 1; i < inputIds.length; i++) {
+    updateCooc(VOCAB[inputIds[i - 1]], VOCAB[inputIds[i]]);
   }
 
   // prophecy

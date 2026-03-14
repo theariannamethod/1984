@@ -9,3 +9,4 @@ test/test_penelope_zig
 test/test_penelope_aml
 *.o
 *.bin
+penelope_rs
