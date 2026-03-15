@@ -738,6 +738,44 @@ static void forward_step(Model *m, int *ctx_ids, int ctx_n, int step_idx,
     matmul_mv(m->embed_out, out, logits, NWORDS, DIM);
 }
 
+/* forward_step_trained: identical to forward_step except final projection.
+ * Instead of embed_out matmul, compute word-level logits from BPE weights:
+ * for each word w, score = mean of dot(embed_in[bpe_tok], out) over its BPE tokens. */
+static void forward_step_trained(Model *m, int *ctx_ids, int ctx_n, int step_idx,
+                          float *logits, float *query, float *query_n,
+                          float *gate, float *up, float *swiglu, float *hidden, float *out) {
+    StepWeights *sw = &m->steps[step_idx];
+    float ctx[DIM];
+    pool_context(m, ctx_ids, ctx_n, ctx);
+
+    /* RRPRAM: query = ctx @ Wr */
+    matmul_mv(sw->wr, ctx, query, DIM, DIM);
+    /* RMSNorm */
+    rmsnorm(query, sw->rms, query_n, DIM);
+    /* SwiGLU */
+    matmul_mv(sw->w_gate, query_n, gate, HDIM, DIM);
+    matmul_mv(sw->w_up, query_n, up, HDIM, DIM);
+    for (int i = 0; i < HDIM; i++)
+        swiglu[i] = siluf(gate[i]) * up[i];
+    matmul_mv(sw->w_down, swiglu, hidden, DIM, HDIM);
+    /* Residual */
+    for (int i = 0; i < DIM; i++)
+        out[i] = query_n[i] + hidden[i];
+    /* Word-level logits from BPE input embeddings */
+    for (int w = 0; w < NWORDS; w++) {
+        float score = 0;
+        int bl = vocab_bpe_len[w];
+        for (int b = 0; b < bl; b++) {
+            int tok = vocab_bpe[w][b];
+            float dot = 0;
+            for (int j = 0; j < DIM; j++)
+                dot += m->embed_in[tok * DIM + j] * out[j];
+            score += dot;
+        }
+        logits[w] = bl > 0 ? score / bl : 0;
+    }
+}
+
 /* ═══════════════════════════════════════════════════════════════
  * SOFTMAX
  * ═══════════════════════════════════════════════════════════════ */
@@ -1359,7 +1397,7 @@ static void extract_key(const char *text, char *out, int maxlen) {
     else { strncpy(out, "silence", maxlen-1); out[maxlen-1]=0; }
 }
 
-static void run_chain(Model *m, const char *text) {
+static void run_chain(Model *m, const char *text, int has_weights) {
     char key[64];
     extract_key(text, key, sizeof(key));
     int seed = find_seed(key);
@@ -1410,7 +1448,10 @@ static void run_chain(Model *m, const char *text) {
         }
 
         /* learned logits */
-        forward_step(m, ctx_bpe, bpe_n, step, logits, query, query_n, gate, up, swiglu, hidden, out);
+        if (has_weights)
+            forward_step_trained(m, ctx_bpe, bpe_n, step, logits, query, query_n, gate, up, swiglu, hidden, out);
+        else
+            forward_step(m, ctx_bpe, bpe_n, step, logits, query, query_n, gate, up, swiglu, hidden, out);
 
         /* Dario field overlay */
         dario_overlay(logits, chain, chain_n, step);
@@ -1530,14 +1571,16 @@ int main(int argc, char **argv) {
     printf("  BPE input: %d subword tokens\n", BPE_VOCAB);
     printf("  by Arianna Method\n\n");
 
-    if (load_path) model_load(&model, load_path);
+    int has_weights = 0;
+    if (load_path) has_weights = model_load(&model, load_path);
     if (train_path) {
+        has_weights = 1;
         train(&model, train_path, train_steps, lr);
         if (save_path) model_save(&model, save_path);
     }
 
     if (text) {
-        run_chain(&model, text);
+        run_chain(&model, text, has_weights);
     } else if (!train_path) {
         char line[1024];
         while (1) {
@@ -1547,7 +1590,7 @@ int main(int argc, char **argv) {
             int len = strlen(line);
             while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = 0;
             if (len == 0) continue;
-            run_chain(&model, line);
+            run_chain(&model, line, has_weights);
         }
     }
 

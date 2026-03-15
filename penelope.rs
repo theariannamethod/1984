@@ -716,6 +716,39 @@ impl Penelope {
         (logits, query, query_n, gate, up, swiglu, out)
     }
 
+    /// Forward pass using BPE embed_in weights for word-level logits (trained mode).
+    /// For each word w, score = mean of dot(embed_in[bpe_tok], out) over the word's BPE tokens.
+    fn forward_step_trained(&self, bpe_ids: &[u16], step: usize, vocab_bpe: &[Vec<u16>])
+        -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)
+    {
+        let sw = &self.steps[step];
+        let ctx = self.pool_context(bpe_ids);
+
+        let query = matmul_mv(&sw.wr, &ctx, DIM, DIM);
+        let query_n = rmsnorm(&query, &sw.rms);
+        let gate = matmul_mv(&sw.w_gate, &query_n, HDIM, DIM);
+        let up = matmul_mv(&sw.w_up, &query_n, HDIM, DIM);
+        let swiglu: Vec<f32> = (0..HDIM).map(|i| silu(gate[i]) * up[i]).collect();
+        let hidden = matmul_mv(&sw.w_down, &swiglu, DIM, HDIM);
+        let out: Vec<f32> = (0..DIM).map(|i| query_n[i] + hidden[i]).collect();
+
+        let mut logits = vec![0.0f32; NWORDS];
+        for w in 0..NWORDS {
+            let bl = vocab_bpe[w].len();
+            let mut score = 0.0f32;
+            for &tok in &vocab_bpe[w] {
+                let mut dot = 0.0f32;
+                for j in 0..DIM {
+                    dot += self.embed_in[tok as usize * DIM + j] * out[j];
+                }
+                score += dot;
+            }
+            logits[w] = if bl > 0 { score / bl as f32 } else { 0.0 };
+        }
+
+        (logits, query, query_n, gate, up, swiglu, out)
+    }
+
     fn save(&self, path: &str) {
         let mut data: Vec<u8> = Vec::new();
         // v2 header: magic, BPE_VOCAB, NWORDS, DIM, HDIM, NSTEPS (6 ints = 24 bytes)
@@ -1228,7 +1261,7 @@ fn init_vocab_bpe() -> Vec<Vec<u16>> {
 }
 
 fn run_chain(model: &Penelope, field: &mut DarioField, text: &str, rng: &mut Rng,
-             vocab_bpe: &[Vec<u16>]) {
+             vocab_bpe: &[Vec<u16>], has_weights: bool) {
     let idx = build_vocab_idx();
     let key = extract_key(text);
     let seed = find_seed(&key, &idx, rng);
@@ -1256,7 +1289,11 @@ fn run_chain(model: &Penelope, field: &mut DarioField, text: &str, rng: &mut Rng
         field.update_chambers(step);
         field.prophecy_age += 1;
 
-        let (mut logits, _, _, _, _, _, _) = model.forward_step(&bpe_buf, step);
+        let (mut logits, _, _, _, _, _, _) = if has_weights {
+            model.forward_step_trained(&bpe_buf, step, vocab_bpe)
+        } else {
+            model.forward_step(&bpe_buf, step)
+        };
         field.overlay(&mut logits, &chain);
 
         for &f in &forbidden { logits[f] = -1e9; }
@@ -1341,7 +1378,7 @@ fn main() {
     println!("  by Arianna Method");
     println!();
 
-    if let Some(ref path) = load_path { model.load(path, &mut rng); }
+    let has_weights = if let Some(ref path) = load_path { model.load(path, &mut rng) } else { false };
     if let Some(ref path) = train_path {
         train(&mut model, path, train_steps, lr);
         if let Some(ref sp) = save_path { model.save(sp); }
@@ -1351,7 +1388,7 @@ fn main() {
     let mut field = DarioField::new();
 
     if let Some(ref t) = text {
-        run_chain(&model, &mut field, t, &mut rng, &vocab_bpe);
+        run_chain(&model, &mut field, t, &mut rng, &vocab_bpe, has_weights);
     } else if train_path.is_none() {
         let stdin = io::stdin();
         loop {
@@ -1361,7 +1398,7 @@ fn main() {
             if stdin.lock().read_line(&mut line).unwrap() == 0 { break; }
             let line = line.trim();
             if line.is_empty() { continue; }
-            run_chain(&model, &mut field, line, &mut rng, &vocab_bpe);
+            run_chain(&model, &mut field, line, &mut rng, &vocab_bpe, has_weights);
         }
     }
 

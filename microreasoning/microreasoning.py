@@ -228,6 +228,41 @@ class MicroReasoner:
         logits = matmul_mv(self.embed_out, out, V, D)
         return logits
 
+    def forward_step_trained(self, bpe_ids, step_idx):
+        """One step: BPE context -> logits[V]. trained mode — word-level logits from BPE weights.
+        identical to forward_step except the final projection:
+        for each word w, score = mean of dot(embed_in[bpe_tok], out) over the word's BPE tokens.
+        information flows FROM weights, not from a separate output embedding."""
+        sw = self.steps[step_idx]
+        ctx = self.pool_context(bpe_ids)
+
+        # RRPRAM resonance: query = ctx @ Wr
+        query = matmul_mv(sw.wr, ctx, D, D)
+
+        # RMSNorm
+        query = rmsnorm(query, sw.rms, D)
+
+        # SwiGLU: hidden = silu(query @ W_gate) * (query @ W_up) @ W_down
+        gate = matmul_mv(sw.w_gate, query, M, D)
+        up = matmul_mv(sw.w_up, query, M, D)
+        swiglu = [silu(gate[i]) * up[i] for i in range(M)]
+        hidden = matmul_mv(sw.w_down, swiglu, D, M)
+
+        # residual
+        out = vadd(query, hidden)
+
+        # word-level logits from BPE weights (embed_in).
+        # for each word w: score = mean of dot(embed_in[bpe_tok], out) over the word's BPE tokens.
+        logits = [0.0] * V
+        for w in range(V):
+            bl = len(VOCAB_BPE[w])
+            score = 0.0
+            for tok in VOCAB_BPE[w]:
+                d = sum(self.embed_in[tok * D + j] * out[j] for j in range(D))
+                score += d
+            logits[w] = score / bl if bl > 0 else 0.0
+        return logits
+
     def save(self, path):
         """Save all weights to binary file (v2 format)."""
         with open(path, "wb") as f:
@@ -1009,7 +1044,7 @@ def extract_key(text):
     return words[0]
 
 
-def run_chain(model, field, text):
+def run_chain(model, field, text, has_weights=False):
     """Run a 12-step chain. seed -> 12 words of emergent resonance."""
     key = extract_key(text)
     seed = find_seed(key)
@@ -1038,7 +1073,10 @@ def run_chain(model, field, text):
             ctx_bpe.extend(VOCAB_BPE[wid])
 
         # learned logits from step-specific weights
-        logits = model.forward_step(ctx_bpe, step)
+        if has_weights:
+            logits = model.forward_step_trained(ctx_bpe, step)
+        else:
+            logits = model.forward_step(ctx_bpe, step)
 
         # Dario field overlay — the live part, the part that breathes
         logits = field.overlay(logits, chain, step)
@@ -1118,16 +1156,19 @@ def main():
     print(f"  BPE input: {BPE_VOCAB} subword tokens")
     print()
 
+    has_weights = False
     if load_path and os.path.exists(load_path):
         model.load(load_path)
+        has_weights = True
 
     if train_path:
         train(model, train_path, train_steps, lr)
+        has_weights = True
         if save_path:
             model.save(save_path)
 
     if text:
-        run_chain(model, field, text)
+        run_chain(model, field, text, has_weights)
     elif not train_path:
         # interactive mode. type a word. get 12 back. that's the deal.
         while True:
@@ -1137,7 +1178,7 @@ def main():
                 break
             if not text:
                 continue
-            run_chain(model, field, text)
+            run_chain(model, field, text, has_weights)
 
     if save_path and not train_path:
         model.save(save_path)

@@ -2329,8 +2329,38 @@ class Penelope {
     // Residual
     const out = vadd(query, hidden);
 
-    // Logits = E_out @ out (separate output embed)
+    // Logits = E_out @ out (separate output embed, weightless mode)
     const logits = matmul_mv(this.embed_out, out, V, D);
+    return logits;
+  }
+
+  forwardStepTrained(bpeIds: number[], stepIdx: number): number[] {
+    const sw = this.steps[stepIdx];
+    const ctx = this.poolContext(bpeIds);
+
+    let query = matmul_mv(sw.wr, ctx, D, D);
+    query = rmsnorm(query, sw.rms, D);
+    const gate = matmul_mv(sw.w_gate, query, M, D);
+    const up = matmul_mv(sw.w_up, query, M, D);
+    const swiglu = new Array(M);
+    for (let i = 0; i < M; i++) swiglu[i] = silu(gate[i]) * up[i];
+    const hidden = matmul_mv(sw.w_down, swiglu, D, M);
+    const out = vadd(query, hidden);
+
+    // Word-level logits from BPE weights: score each word by its BPE tokens
+    const logits = new Array(V);
+    for (let w = 0; w < V; w++) {
+      const bl = vocabBpe[w].length;
+      let score = 0;
+      for (let b = 0; b < bl; b++) {
+        const tok = vocabBpe[w][b];
+        let dot = 0;
+        for (let j = 0; j < D; j++)
+          dot += this.embed_in[tok * D + j] * out[j];
+        score += dot;
+      }
+      logits[w] = bl > 0 ? score / bl : 0;
+    }
     return logits;
   }
 
@@ -2830,7 +2860,7 @@ function extract_key(text: string): string {
 }
 
 
-function run_chain(model: Penelope, field: DarioField, text: string): number[] {
+function run_chain(model: Penelope, field: DarioField, text: string, hasWeights: boolean = false): number[] {
   const key = extract_key(text);
   const seed = find_seed(key);
 
@@ -2857,8 +2887,10 @@ function run_chain(model: Penelope, field: DarioField, text: string): number[] {
     field.updateChambers(step);
     field.prophecyAge++;
 
-    // learned logits — uses BPE context
-    let logits = model.forwardStep(bpeBuf, step);
+    // learned logits — trained: BPE-weighted word scores, weightless: embed_out
+    let logits = hasWeights
+      ? model.forwardStepTrained(bpeBuf, step)
+      : model.forwardStep(bpeBuf, step);
 
     // Dario field overlay (uses word-level chain for co-occurrence)
     logits = field.overlay(logits, chain, step);
@@ -2958,19 +2990,25 @@ function main(): void {
   console.log(`  by Arianna Method`);
   console.log();
 
+  let hasWeights = false;
   if (loadPath && fs.existsSync(loadPath)) {
     model.load(loadPath);
+    hasWeights = true;
   }
 
   if (trainPath) {
     train(model, trainPath, trainSteps, lr);
+    hasWeights = true;
     if (savePath) {
       model.save(savePath);
     }
   }
 
+  console.log(`  mode: ${hasWeights ? "trained (BPE word scores)" : "weightless (word-level)"}`);
+  console.log();
+
   if (text) {
-    run_chain(model, field, text);
+    run_chain(model, field, text, hasWeights);
   } else if (!trainPath) {
     const rl = readline.createInterface({
       input: process.stdin,
@@ -2983,7 +3021,7 @@ function main(): void {
           prompt();
           return;
         }
-        run_chain(model, field, trimmed);
+        run_chain(model, field, trimmed, hasWeights);
         prompt();
       });
     };

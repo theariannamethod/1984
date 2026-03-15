@@ -1886,6 +1886,51 @@ static int bpe_encode(const char *text, int *ids, int max_ids) {
     return n;
 }
 
+/* ═══════════════════════════════════════════════════════════════
+ * BPE DECODE — token IDs back to text
+ * Build string table from merge table at init time.
+ * ═══════════════════════════════════════════════════════════════ */
+
+static char bpe_strs[BPE_VOCAB][64];
+static int  bpe_str_len[BPE_VOCAB];
+
+static void init_bpe_decode(void) {
+    /* base tokens: single bytes */
+    for (int i = 0; i < 256; i++) {
+        bpe_strs[i][0] = (char)i;
+        bpe_strs[i][1] = '\0';
+        bpe_str_len[i] = 1;
+    }
+    /* merged tokens: concatenation of operands */
+    for (int m = 0; m < BPE_MERGES; m++) {
+        int id = 256 + m;
+        int left = BPE_TABLE[m][0];
+        int right = BPE_TABLE[m][1];
+        int ll = bpe_str_len[left];
+        int rl = bpe_str_len[right];
+        if (ll + rl < 63) {
+            memcpy(bpe_strs[id], bpe_strs[left], ll);
+            memcpy(bpe_strs[id] + ll, bpe_strs[right], rl);
+            bpe_strs[id][ll + rl] = '\0';
+            bpe_str_len[id] = ll + rl;
+        }
+    }
+}
+
+static int bpe_decode(int *ids, int n, char *out, int max_out) {
+    int pos = 0;
+    for (int i = 0; i < n && pos < max_out - 64; i++) {
+        int id = ids[i];
+        if (id >= 0 && id < BPE_VOCAB) {
+            int sl = bpe_str_len[id];
+            memcpy(out + pos, bpe_strs[id], sl);
+            pos += sl;
+        }
+    }
+    out[pos] = '\0';
+    return pos;
+}
+
 static const char *VOCAB[NWORDS] = {
 /* BODY 0-99 */
 "flesh","bone","blood","skin","hand","eye","mouth","tongue","heart","lung",
@@ -2523,8 +2568,109 @@ static void forward_step(Model *m, int *bpe_ids, int bpe_n, int step_idx,
     /* Residual */
     for (int i = 0; i < DIM; i++)
         out[i] = query_n[i] + hidden[i];
-    /* Logits = E_out @ out (separate output embed) */
+    /* Logits = E_out @ out (separate output embed, word-level) */
     matmul_mv(m->embed_out, out, logits, NWORDS, DIM);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * EXTENDED VOCAB — hardcoded 1984 + BPE tokens that are whole words
+ * Built at init from bpe_strs[]. Word-level always, gibberish impossible.
+ * ═══════════════════════════════════════════════════════════════ */
+
+#define MAX_EXT_VOCAB 4096
+
+/* extended vocab entry: word string, BPE token IDs, count */
+typedef struct {
+    char word[64];
+    int  bpe_ids[16];
+    int  bpe_len;
+    int  from_hardcoded; /* 1 = from VOCAB[1984], 0 = from BPE decode */
+} ExtWord;
+
+static ExtWord ext_vocab[MAX_EXT_VOCAB];
+static int ext_vocab_n = 0;
+
+static int is_alpha_word(const char *s) {
+    if (!s[0] || !s[1]) return 0; /* min 2 chars */
+    for (int i = 0; s[i]; i++)
+        if (!((s[i] >= 'a' && s[i] <= 'z') || (s[i] >= 'A' && s[i] <= 'Z')))
+            return 0;
+    return 1;
+}
+
+static int ext_vocab_find(const char *w) {
+    for (int i = 0; i < ext_vocab_n; i++)
+        if (strcmp(ext_vocab[i].word, w) == 0) return i;
+    return -1;
+}
+
+static void init_ext_vocab(void) {
+    ext_vocab_n = 0;
+
+    /* 1. Add all 1984 hardcoded words */
+    for (int i = 0; i < NWORDS && ext_vocab_n < MAX_EXT_VOCAB; i++) {
+        ExtWord *ew = &ext_vocab[ext_vocab_n];
+        strncpy(ew->word, VOCAB[i], 63); ew->word[63] = 0;
+        memcpy(ew->bpe_ids, vocab_bpe[i], vocab_bpe_len[i] * sizeof(int));
+        ew->bpe_len = vocab_bpe_len[i];
+        ew->from_hardcoded = 1;
+        ext_vocab_n++;
+    }
+
+    /* 2. Add BPE tokens that decode to whole words (not already in vocab) */
+    for (int t = 0; t < BPE_VOCAB && ext_vocab_n < MAX_EXT_VOCAB; t++) {
+        if (!is_alpha_word(bpe_strs[t])) continue;
+        /* lowercase for comparison */
+        char lower[64];
+        int sl = bpe_str_len[t];
+        if (sl >= 64) continue;
+        for (int i = 0; i < sl; i++)
+            lower[i] = (bpe_strs[t][i] >= 'A' && bpe_strs[t][i] <= 'Z')
+                      ? bpe_strs[t][i] + 32 : bpe_strs[t][i];
+        lower[sl] = 0;
+        if (ext_vocab_find(lower) >= 0) continue; /* already in vocab */
+        ExtWord *ew = &ext_vocab[ext_vocab_n];
+        strncpy(ew->word, lower, 63); ew->word[63] = 0;
+        ew->bpe_ids[0] = t;
+        ew->bpe_len = 1;
+        ew->from_hardcoded = 0;
+        ext_vocab_n++;
+    }
+
+    printf("  extended vocab: %d words (%d hardcoded + %d from BPE)\n",
+           ext_vocab_n, NWORDS, ext_vocab_n - NWORDS);
+}
+
+/* forward through BPE weights — extended word-level output */
+static void forward_step_trained(Model *m, int *bpe_ids, int bpe_n, int step_idx,
+                                  float *logits, float *query, float *query_n,
+                                  float *gate, float *up, float *swiglu, float *hidden, float *out) {
+    StepWeights *sw = &m->steps[step_idx];
+    float ctx[DIM];
+    pool_context(m, bpe_ids, bpe_n, ctx);
+
+    matmul_mv(sw->wr, ctx, query, DIM, DIM);
+    rmsnorm(query, sw->rms, query_n, DIM);
+    matmul_mv(sw->w_gate, query_n, gate, HDIM, DIM);
+    matmul_mv(sw->w_up, query_n, up, HDIM, DIM);
+    for (int i = 0; i < HDIM; i++)
+        swiglu[i] = siluf(gate[i]) * up[i];
+    matmul_mv(sw->w_down, swiglu, hidden, DIM, HDIM);
+    for (int i = 0; i < DIM; i++)
+        out[i] = query_n[i] + hidden[i];
+    /* Score each word in extended vocab by its BPE tokens */
+    for (int w = 0; w < ext_vocab_n; w++) {
+        float score = 0;
+        int bl = ext_vocab[w].bpe_len;
+        for (int b = 0; b < bl; b++) {
+            int tok = ext_vocab[w].bpe_ids[b];
+            float dot = 0;
+            for (int j = 0; j < DIM; j++)
+                dot += m->embed_in[tok * DIM + j] * out[j];
+            score += dot;
+        }
+        logits[w] = bl > 0 ? score / bl : 0;
+    }
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -2989,44 +3135,43 @@ static void extract_key(const char *text, char *out, int maxlen) {
     else { strncpy(out, "silence", maxlen-1); out[maxlen-1]=0; }
 }
 
-static void run_chain(Model *m, const char *text) {
+static void run_chain(Model *m, const char *text, int has_weights) {
     char key[64];
     extract_key(text, key, sizeof(key));
-    int seed = find_seed(key);
 
-    /* prophecy */
+    int seed = find_seed(key);
+    printf("\n  %s\n", VOCAB[seed]);
+
+    /* prophecy (word-level, for both modes) */
     int deep_cats[] = {2, 5, 7};
     int tcat = deep_cats[rand() % 3];
     int ranges[][2] = {{0,100},{100,200},{200,300},{300,350},{350,450},{450,550},{550,650},{650,NWORDS}};
     prophecy_target = ranges[tcat][0] + rand() % (ranges[tcat][1] - ranges[tcat][0]);
     if (prophecy_target >= NWORDS) prophecy_target = NWORDS - 1;
     prophecy_age = 0;
+    printf("  destined: %s\n\n", VOCAB[prophecy_target]);
 
-    printf("\n  destined: %s\n", VOCAB[prophecy_target]);
-    printf("\n  %s\n", VOCAB[seed]);
+    /* BPE context buffer — starts with seed word's BPE tokens */
+    int bpe_buf[MAX_BPE_SEQ];
+    int bpe_n = 0;
+    memcpy(bpe_buf, vocab_bpe[seed], vocab_bpe_len[seed] * sizeof(int));
+    bpe_n = vocab_bpe_len[seed];
 
+    /* word-level chain for Dario field (both modes) */
     int chain[NSTEPS+1], chain_n = 0;
     int forbidden[NSTEPS+100], nforbid = 0;
     chain[chain_n++] = seed;
     forbidden[nforbid++] = seed;
 
-    /* BPE token buffer for context — grows as words are added */
-    int bpe_buf[MAX_BPE_SEQ];
-    int bpe_n = 0;
-    /* add seed word's BPE tokens */
-    memcpy(bpe_buf, vocab_bpe[seed], vocab_bpe_len[seed] * sizeof(int));
-    bpe_n = vocab_bpe_len[seed];
-
-    int prev = seed;
-
-    /* scratch */
-    float *logits  = (float *)malloc(NWORDS * sizeof(float));
-    float *probs   = (float *)malloc(NWORDS * sizeof(float));
+    /* scratch — sized for max(NWORDS, ext_vocab_n) */
+    int gen_vocab = has_weights ? ext_vocab_n : NWORDS;
+    float *logits  = (float *)malloc(gen_vocab * sizeof(float));
+    float *probs   = (float *)malloc(gen_vocab * sizeof(float));
     float *query   = (float *)malloc(DIM * sizeof(float));
     float *query_n = (float *)malloc(DIM * sizeof(float));
     float *gate    = (float *)malloc(HDIM * sizeof(float));
     float *up      = (float *)malloc(HDIM * sizeof(float));
-    float *swiglu  = (float *)malloc(HDIM * sizeof(float));
+    float *swiglu_b= (float *)malloc(HDIM * sizeof(float));
     float *hidden  = (float *)malloc(DIM * sizeof(float));
     float *out     = (float *)malloc(DIM * sizeof(float));
 
@@ -3036,64 +3181,126 @@ static void run_chain(Model *m, const char *text) {
         update_chambers(step);
         prophecy_age++;
 
-        /* learned logits — uses BPE context */
-        forward_step(m, bpe_buf, bpe_n, step, logits, query, query_n, gate, up, swiglu, hidden, out);
+        if (has_weights) {
+            /* TRAINED MODE: extended vocab, scores from BPE weights */
+            forward_step_trained(m, bpe_buf, bpe_n, step,
+                                 logits, query, query_n, gate, up, swiglu_b, hidden, out);
 
-        /* Dario field overlay (still uses word-level chain for co-occurrence) */
-        dario_overlay(logits, chain, chain_n, step);
+            /* Dario overlay on hardcoded portion */
+            dario_overlay(logits, chain, chain_n, step);
 
-        /* mask forbidden */
-        for (int f = 0; f < nforbid; f++)
-            logits[forbidden[f]] = -1e9f;
-
-        /* top-k=12 sampling */
-        softmax_v(logits, probs, NWORDS);
-        typedef struct { int idx; float p; } Sc;
-        Sc top[12];
-        for (int i = 0; i < 12; i++) top[i] = (Sc){0, -1};
-
-        for (int w = 0; w < NWORDS; w++) {
-            for (int k = 0; k < 12; k++) {
-                if (probs[w] > top[k].p) {
-                    for (int j = 11; j > k; j--) top[j] = top[j-1];
-                    top[k] = (Sc){w, probs[w]};
-                    break;
+            /* mask forbidden by word string */
+            for (int w = 0; w < ext_vocab_n; w++) {
+                for (int f = 0; f < nforbid; f++) {
+                    if (strcmp(ext_vocab[w].word, ext_vocab[forbidden[f]].word) == 0) {
+                        logits[w] = -1e9f;
+                        break;
+                    }
                 }
             }
+
+            /* top-k=12 sampling from ext_vocab_n */
+            softmax_v(logits, probs, ext_vocab_n);
+            typedef struct { int idx; float p; } Sc;
+            Sc top[12];
+            for (int i = 0; i < 12; i++) top[i] = (Sc){0, -1};
+            for (int w = 0; w < ext_vocab_n; w++) {
+                for (int k = 0; k < 12; k++) {
+                    if (probs[w] > top[k].p) {
+                        for (int j = 11; j > k; j--) top[j] = top[j-1];
+                        top[k] = (Sc){w, probs[w]};
+                        break;
+                    }
+                }
+            }
+            float total = 0.001f;
+            for (int i = 0; i < 12; i++) total += top[i].p > 0 ? top[i].p : 0;
+            float r = randf() * total;
+            int pick = top[0].idx;
+            for (int i = 0; i < 12; i++) {
+                r -= top[i].p > 0 ? top[i].p : 0;
+                if (r <= 0) { pick = top[i].idx; break; }
+            }
+
+            chain[chain_n++] = pick;
+            forbidden[nforbid++] = pick;
+
+            /* append picked word's BPE tokens to context */
+            if (bpe_n + ext_vocab[pick].bpe_len < MAX_BPE_SEQ) {
+                memcpy(bpe_buf + bpe_n, ext_vocab[pick].bpe_ids,
+                       ext_vocab[pick].bpe_len * sizeof(int));
+                bpe_n += ext_vocab[pick].bpe_len;
+            }
+
+            /* Dario field updates (use hardcoded index if available) */
+            if (pick < NWORDS) {
+                cooc_update(chain_n >= 2 ? chain[chain_n-2] : seed, pick);
+                int cat = word_category(pick);
+                destiny[cat] = 0.3f + 0.7f * destiny[cat];
+                if (pick == prophecy_target) fulfilled = 1;
+            }
+
+            if (step > 7) trauma = trauma + 0.1f < 1 ? trauma + 0.1f : 1;
+            trauma *= 0.97f;
+
+            if (step == NSTEPS - 1)
+                printf("  *%s\n", ext_vocab[pick].word);
+            else
+                printf("   %s\n", ext_vocab[pick].word);
+
+        } else {
+            /* WEIGHTLESS MODE: hardcoded 1984 words, embed_out */
+            forward_step(m, bpe_buf, bpe_n, step,
+                         logits, query, query_n, gate, up, swiglu_b, hidden, out);
+
+            dario_overlay(logits, chain, chain_n, step);
+
+            for (int f = 0; f < nforbid; f++)
+                logits[forbidden[f]] = -1e9f;
+
+            softmax_v(logits, probs, NWORDS);
+            typedef struct { int idx; float p; } Sc2;
+            Sc2 top[12];
+            for (int i = 0; i < 12; i++) top[i] = (Sc2){0, -1};
+            for (int w = 0; w < NWORDS; w++) {
+                for (int k = 0; k < 12; k++) {
+                    if (probs[w] > top[k].p) {
+                        for (int j = 11; j > k; j--) top[j] = top[j-1];
+                        top[k] = (Sc2){w, probs[w]};
+                        break;
+                    }
+                }
+            }
+            float total = 0.001f;
+            for (int i = 0; i < 12; i++) total += top[i].p > 0 ? top[i].p : 0;
+            float r = randf() * total;
+            int pick = top[0].idx;
+            for (int i = 0; i < 12; i++) {
+                r -= top[i].p > 0 ? top[i].p : 0;
+                if (r <= 0) { pick = top[i].idx; break; }
+            }
+
+            chain[chain_n++] = pick;
+            forbidden[nforbid++] = pick;
+
+            if (bpe_n + vocab_bpe_len[pick] < MAX_BPE_SEQ) {
+                memcpy(bpe_buf + bpe_n, vocab_bpe[pick], vocab_bpe_len[pick] * sizeof(int));
+                bpe_n += vocab_bpe_len[pick];
+            }
+
+            cooc_update(chain_n >= 2 ? chain[chain_n-2] : seed, pick);
+            int cat = word_category(pick);
+            destiny[cat] = 0.3f + 0.7f * destiny[cat];
+            if (pick == prophecy_target) fulfilled = 1;
+
+            if (step > 7) trauma = trauma + 0.1f < 1 ? trauma + 0.1f : 1;
+            trauma *= 0.97f;
+
+            if (step == NSTEPS - 1)
+                printf("  *%s\n", VOCAB[pick]);
+            else
+                printf("   %s\n", VOCAB[pick]);
         }
-
-        float total = 0.001f;
-        for (int i = 0; i < 12; i++) total += top[i].p > 0 ? top[i].p : 0;
-        float r = randf() * total;
-        int pick = top[0].idx;
-        for (int i = 0; i < 12; i++) {
-            r -= top[i].p > 0 ? top[i].p : 0;
-            if (r <= 0) { pick = top[i].idx; break; }
-        }
-
-        chain[chain_n++] = pick;
-        forbidden[nforbid++] = pick;
-
-        /* append picked word's BPE tokens to buffer */
-        if (bpe_n + vocab_bpe_len[pick] < MAX_BPE_SEQ) {
-            memcpy(bpe_buf + bpe_n, vocab_bpe[pick], vocab_bpe_len[pick] * sizeof(int));
-            bpe_n += vocab_bpe_len[pick];
-        }
-
-        cooc_update(prev, pick);
-        int cat = word_category(pick);
-        destiny[cat] = 0.3f + 0.7f * destiny[cat];
-
-        if (pick == prophecy_target) fulfilled = 1;
-
-        if (step > 7) trauma = trauma + 0.1f < 1 ? trauma + 0.1f : 1;
-        trauma *= 0.97f;
-
-        if (step == NSTEPS - 1)
-            printf("  *%s\n", VOCAB[pick]);
-        else
-            printf("   %s\n", VOCAB[pick]);
-        prev = pick;
     }
 
     int cats_seen = 0, cat_flags[8] = {0};
@@ -3106,7 +3313,7 @@ static void run_chain(Model *m, const char *text) {
            cats_seen, fulfilled ? "fulfilled" : "unfulfilled");
 
     free(logits); free(probs); free(query); free(query_n);
-    free(gate); free(up); free(swiglu); free(hidden); free(out);
+    free(gate); free(up); free(swiglu_b); free(hidden); free(out);
 }
 
 
@@ -3118,6 +3325,8 @@ int main(int argc, char **argv) {
     srand(time(NULL));
     init_vocab_lens();
     init_vocab_bpe();
+    init_bpe_decode();
+    init_ext_vocab();
 
     char *train_path = NULL;
     char *load_path = NULL;
@@ -3154,14 +3363,18 @@ int main(int argc, char **argv) {
     printf("  BPE input: %d subword tokens\n", BPE_VOCAB);
     printf("  by Arianna Method\n\n");
 
-    if (load_path) model_load(&model, load_path);
+    int has_weights = 0;
+    if (load_path) { model_load(&model, load_path); has_weights = 1; }
     if (train_path) {
         train(&model, train_path, train_steps, lr);
+        has_weights = 1;
         if (save_path) model_save(&model, save_path);
     }
 
+    printf("  mode: %s\n\n", has_weights ? "trained (BPE word scores)" : "weightless (word-level)");
+
     if (text) {
-        run_chain(&model, text);
+        run_chain(&model, text, has_weights);
     } else if (!train_path) {
         char line[1024];
         while (1) {
@@ -3171,7 +3384,7 @@ int main(int argc, char **argv) {
             int len = strlen(line);
             while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = 0;
             if (len == 0) continue;
-            run_chain(&model, line);
+            run_chain(&model, line, has_weights);
         }
     }
 

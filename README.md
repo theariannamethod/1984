@@ -12,15 +12,17 @@ Janus Architecture.
 
 Not a transformer. Not pretending to be.
 
-Penelope represents a shift toward post-probabilistic, post-symbolic AI. She doesn't predict the next token from a statistical distribution over a corpus. She resonates. A fixed vocabulary of exactly 1984 words — body, nature, emotion, time, society, abstraction, action, ritual, geometry, myth — becomes a closed universe of meaning. Every output is a real word. Gibberish is architecturally impossible.
+Penelope represents a shift toward post-probabilistic, post-symbolic AI. She doesn't predict the next token from a statistical distribution over a corpus. She resonates. A curated vocabulary of 1984 words — body, nature, emotion, time, society, abstraction, action, ritual, geometry, myth — forms the core. In trained mode, every BPE token that decodes to a whole word joins the candidates (~2754 total), scored through learned BPE weights. In weightless mode, the 1984 curated words stand alone. Either way, every output is a real word. Gibberish is architecturally impossible.
 
 ## Introduction
 
 Say hello to Penelope. Or type something. It doesn't matter — she will detect your most charged word (or just the noisiest one) and walk 12 steps from it. Each step is another generation. Twelve steps, twelve different weight sets, twelve lenses on the same context. Step 1 sees the surface. Step 12 sees the bone.
 
-Penelope works in two modes. In **weightless mode** (no training), she generates coherent associative chains from the Dario Field alone — Hebbian co-occurrence, bigram affinity, prophecy, destiny, and six Kuramoto-coupled emotional chambers. Even without training, the dual tokenizer guarantees meaningful output: BPE on input to read arbitrary text with nuance, word-level on output to ensure every generation is a clean, real word.
+Penelope works in two modes. In **weightless mode** (no training), she generates coherent associative chains from the Dario Field alone — Hebbian co-occurrence, bigram affinity, prophecy, destiny, and six Kuramoto-coupled emotional chambers. Output comes from the 1984 curated words via `embed_out`.
 
-After **training**, each of the 12 steps acquires its own ~1.03M parameters (RRPRAM resonance matrix + RMSNorm + SwiGLU). Total ~14M params: 786K input BPE embedding (2048 subword tokens), 762K output word embedding (1984 words), and 12 × 1.03M step weights. No weight tying — input and output are separate embedding spaces.
+After **training**, the dual tokenizer does what it was built for: information flows from BPE weights. Each word's score is computed through its BPE token embeddings in `embed_in` — the mean dot product of the hidden state with each of the word's BPE subtoken vectors. The extended vocabulary includes every BPE token that decodes to a whole word, mixed with the 1984 curated words. Word-level output always. No gibberish possible, even with bad loss.
+
+Each of the 12 steps has its own ~1.03M parameters (RRPRAM resonance matrix + RMSNorm + SwiGLU). Total ~14M params: 786K input BPE embedding (2048 subword tokens), 762K output word embedding (1984 words, weightless fallback), and 12 × 1.03M step weights.
 
 The architecture per step:
 
@@ -28,7 +30,13 @@ The architecture per step:
 context = pool(embed_in(BPE tokens))
 query   = RMSNorm(context @ Wr)           RRPRAM resonance
 hidden  = SwiGLU(query; gate, up, down)
-logits  = (query + hidden) @ E_out^T      separate output embed
+out     = query + hidden
+
+# trained mode: score each word by its BPE tokens from embed_in
+logits[w] = mean(embed_in[bpe_tok] · out)  for each word w
+# weightless mode: score from separate embed_out
+logits  = out @ E_out^T
+
 logits += DarioField(context)              live overlay
 word    = sample(softmax(logits))
 ```
@@ -93,7 +101,7 @@ The only fulfilled prophecy. She was destined for ambivalence — and found it a
 
 ## Implementations
 
-The multiplicity of language implementations underscores the fundamentality of the architecture. Penelope is not bound to a runtime or a framework. The same resonance engine, the same 1984 words, the same 12 steps — expressed identically across 8 programming languages:
+The multiplicity of language implementations underscores the fundamentality of the architecture. Penelope is not bound to a runtime or a framework. The same resonance engine, the same dual tokenizer, the same 12 steps — expressed identically across 8 programming languages:
 
 | Language | File | Build |
 |----------|------|-------|
@@ -160,15 +168,15 @@ Weightless generation (no training):
   prophecy unfulfilled            prophecy unfulfilled
 ```
 
-Even without training, the dual tokenizer (BPE input, word-level output) and the Dario Field (Hebbian co-occurrence, prophecy, destiny, Kuramoto chambers) produce associative chains where every step is a real word. Train it on Gutenberg, Dostoevsky, or your diary — the associations become sharper, the resonance deepens.
+Even without training, the Dario Field (Hebbian co-occurrence, prophecy, destiny, Kuramoto chambers) produces associative chains where every step is a real word. Train it on Gutenberg, Dostoevsky, or your diary — the dual tokenizer pulls word scores from BPE weights, the extended vocabulary opens up, the resonance deepens.
 
-## The 1984 Words
+## The Vocabulary
 
-The vocabulary is curated, not scraped. 29 semantic categories:
+The core 1984 words are curated, not scraped. 29 semantic categories:
 
 Body, Nature, Emotion, Time, Society, Abstract, Action, Material, Food, Architecture, Relationship, Philosophy, Music, Weather, Ritual, Labor, Geometry, Animal, Color, Transport, Domestic, Communication, Medical, Cosmic, Bureaucracy, Mythic, Textual, Psychological, Final.
 
-No word is wasted. No word is missing.
+No word is wasted. No word is missing. In trained mode, the vocabulary extends beyond these 1984 — every BPE token that decodes to a whole word becomes a candidate, scored through learned weights.
 
 ---
 

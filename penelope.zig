@@ -2735,6 +2735,54 @@ fn forwardStep(
     matmulMv(m.embed_out, out, logits, NWORDS, DIM);
 }
 
+fn forwardStepTrained(
+    m: *Model,
+    ctx_ids: []const i32,
+    step_idx: usize,
+    logits: []f32,
+    query: []f32,
+    query_n: []f32,
+    gate_buf: []f32,
+    up_buf: []f32,
+    swiglu_buf: []f32,
+    hidden: []f32,
+    out: []f32,
+) void {
+    const sw = &m.steps[step_idx];
+    var ctx: [DIM]f32 = undefined;
+    poolContext(m, ctx_ids, &ctx);
+
+    // RRPRAM: query = ctx @ Wr
+    matmulMv(sw.wr, &ctx, query, DIM, DIM);
+    // RMSNorm
+    rmsnorm(query, sw.rms, query_n, DIM);
+    // SwiGLU
+    matmulMv(sw.w_gate, query_n, gate_buf, HDIM, DIM);
+    matmulMv(sw.w_up, query_n, up_buf, HDIM, DIM);
+    for (0..HDIM) |i| {
+        swiglu_buf[i] = siluf(gate_buf[i]) * up_buf[i];
+    }
+    matmulMv(sw.w_down, swiglu_buf, hidden, DIM, HDIM);
+    // Residual
+    for (0..DIM) |i| {
+        out[i] = query_n[i] + hidden[i];
+    }
+    // Word-level logits from BPE input embeddings
+    for (0..NWORDS) |w| {
+        var score: f32 = 0;
+        const bl = vocab_bpe_len[w];
+        for (0..bl) |b| {
+            const tok: usize = @intCast(vocab_bpe[w][b]);
+            var dot: f32 = 0;
+            for (0..DIM) |j| {
+                dot += m.embed_in[tok * DIM + j] * out[j];
+            }
+            score += dot;
+        }
+        logits[w] = if (bl > 0) score / @as(f32, @floatFromInt(bl)) else 0;
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════
 // SOFTMAX
 // ═══════════════════════════════════════════════════════════════
@@ -3420,7 +3468,7 @@ fn extractKey(text: []const u8, out_buf: []u8) []const u8 {
     }
 }
 
-fn runChain(m: *Model, text: []const u8, allocator: std.mem.Allocator) !void {
+fn runChain(m: *Model, text: []const u8, has_weights: bool, allocator: std.mem.Allocator) !void {
     const stdout_w = (std.fs.File{ .handle = std.posix.STDOUT_FILENO }).deprecatedWriter();
 
     var key_buf: [64]u8 = undefined;
@@ -3497,7 +3545,11 @@ fn runChain(m: *Model, text: []const u8, allocator: std.mem.Allocator) !void {
         prophecy_age += 1;
 
         // learned logits - uses BPE context
-        forwardStep(m, bpe_buf[0..bpe_n], step, logits, query, query_n, gate_buf, up_buf, swiglu_buf, hidden, out);
+        if (has_weights) {
+            forwardStepTrained(m, bpe_buf[0..bpe_n], step, logits, query, query_n, gate_buf, up_buf, swiglu_buf, hidden, out);
+        } else {
+            forwardStep(m, bpe_buf[0..bpe_n], step, logits, query, query_n, gate_buf, up_buf, swiglu_buf, hidden, out);
+        }
 
         // Dario field overlay
         darioOverlay(logits, chain[0..chain_n], step);
@@ -3666,10 +3718,13 @@ pub fn main() !void {
     });
     try stdout_w.print("  by Arianna Method\n\n", .{});
 
+    var has_weights = false;
     if (load_path) |lp| {
         _ = try modelLoad(&model, lp);
+        has_weights = true;
     }
     if (train_path) |tp| {
+        has_weights = true;
         try train(&model, tp, train_steps_count, lr, allocator);
         if (save_path) |sp| {
             try modelSave(&model, sp);
@@ -3677,7 +3732,7 @@ pub fn main() !void {
     }
 
     if (text_input) |txt| {
-        try runChain(&model, txt, allocator);
+        try runChain(&model, txt, has_weights, allocator);
     } else if (train_path == null) {
         const stdin = (std.fs.File{ .handle = std.posix.STDIN_FILENO }).deprecatedReader();
         var line_buf: [1024]u8 = undefined;
@@ -3693,7 +3748,7 @@ pub fn main() !void {
                 trimmed = trimmed[0 .. trimmed.len - 1];
             }
             if (trimmed.len == 0) continue;
-            try runChain(&model, trimmed, allocator);
+            try runChain(&model, trimmed, has_weights, allocator);
         }
     }
 

@@ -2303,6 +2303,44 @@ function forward_step(model::Penelope, bpe_ids::Vector{Int}, step_idx::Int)
     return logits
 end
 
+function forward_step_trained(model::Penelope, bpe_ids::Vector{Int}, step_idx::Int)
+    # Identical to forward_step, but computes word-level logits from BPE embed_in weights
+    sw = model.steps[step_idx + 1]  # Julia 1-based
+    ctx = pool_context(model, bpe_ids)
+
+    # RRPRAM resonance: query = ctx @ Wr
+    query = matmul_mv(sw.wr, ctx, D, D)
+
+    # RMSNorm
+    query = rmsnorm(query, sw.rms, D)
+
+    # SwiGLU
+    gate = matmul_mv(sw.w_gate, query, M, D)
+    up = matmul_mv(sw.w_up, query, M, D)
+    swiglu = [_silu(gate[i]) * up[i] for i in 1:M]
+    hidden = matmul_mv(sw.w_down, swiglu, D, M)
+
+    # Residual
+    out = vadd(query, hidden)
+
+    # Word-level logits from BPE weights (embed_in)
+    # For each word w, score = mean of dot(embed_in[bpe_tok], out) over its BPE tokens
+    logits = zeros(Float64, V)
+    for w in 1:V
+        bl = length(VOCAB_BPE[w])
+        score = 0.0
+        for tok_id in VOCAB_BPE[w]
+            dot_val = 0.0
+            for j in 1:D
+                dot_val += model.embed_in[(tok_id) * D + j] * out[j]
+            end
+            score += dot_val
+        end
+        logits[w] = bl > 0 ? score / bl : 0.0
+    end
+    return logits
+end
+
 function save_model(model::Penelope, path::String)
     open(path, "w") do f
         # v2 header: magic, BPE_VOCAB, V, D, M, STEPS
@@ -2905,7 +2943,7 @@ function extract_key(text::String)
     return String(words[1])
 end
 
-function run_chain(model::Penelope, field::DarioField, text::String)
+function run_chain(model::Penelope, field::DarioField, text::String, has_weights::Bool=false)
     key = extract_key(text)
     seed = find_seed(key)
 
@@ -2930,7 +2968,7 @@ function run_chain(model::Penelope, field::DarioField, text::String)
         field.prophecy_age += 1
 
         # learned logits — uses BPE context
-        logits = forward_step(model, bpe_buf, step)
+        logits = has_weights ? forward_step_trained(model, bpe_buf, step) : forward_step(model, bpe_buf, step)
 
         # Dario field overlay (still uses word-level chain for co-occurrence)
         logits = overlay!(field, logits, chain, step)
@@ -3029,19 +3067,22 @@ function main()
     println("  by Arianna Method")
     println()
 
+    has_weights = false
     if load_path !== nothing && isfile(load_path)
         load_model!(model, load_path)
+        has_weights = true
     end
 
     if train_path !== nothing
         train!(model, train_path, train_steps, lr)
+        has_weights = true
         if save_path !== nothing
             save_model(model, save_path)
         end
     end
 
     if text !== nothing
-        run_chain(model, field, text)
+        run_chain(model, field, text, has_weights)
     elseif train_path === nothing
         while true
             print("  > ")
@@ -3055,7 +3096,7 @@ function main()
             if isempty(line)
                 continue
             end
-            run_chain(model, field, String(line))
+            run_chain(model, field, String(line), has_weights)
         end
     end
 
