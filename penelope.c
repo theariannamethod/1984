@@ -2845,7 +2845,8 @@ static TrainTokens tokenize_for_training(const char *text) {
             word[wl++] = buf[pos++];
         word[wl] = '\0';
 
-        if (wl < 2 || is_stop(word)) continue;
+        if (wl < 2) continue;
+        /* stop words kept in training: they provide contiguous context */
 
         /* get vocab ID */
         int vid = find_word(word);
@@ -2855,14 +2856,14 @@ static TrainTokens tokenize_for_training(const char *text) {
             int ns = greedy_vocab_match(word, wl, sub, 8);
             if (ns > 0) vid = sub[0];  /* take first match as representative */
         }
-        if (vid < 0) continue;  /* skip unknown words */
-
-        /* get BPE encoding of the word text */
+        /* get BPE encoding of the word text (always — for context) */
         int bpe_ids[64];
         int bpe_n = bpe_encode(word, bpe_ids, 64);
 
+        /* vid < 0 = unknown word: include in BPE context but mark as -1
+           (won't be used as target, but preserves contiguous text flow) */
         int w = t.n_words;
-        t.word_ids[w] = vid;
+        t.word_ids[w] = vid;  /* -1 for unknown */
         t.bpe_offset[w] = bpe_pos;
         t.bpe_len[w] = bpe_n;
         memcpy(t.bpe_flat + bpe_pos, bpe_ids, bpe_n * sizeof(int));
@@ -2946,9 +2947,9 @@ static void train(Model *m, const char *data_path, int train_steps, float lr) {
 
     float best_loss = 1e9f;
 
-    for (int step = 1; step <= train_steps; step++) {
-        int start = rand() % (tok.n_words - window);
+    int batch_size = 32;
 
+    for (int step = 1; step <= train_steps; step++) {
         float total_loss = 0;
 
         /* zero grad accumulators */
@@ -2961,9 +2962,13 @@ static void train(Model *m, const char *data_path, int train_steps, float lr) {
             memset(g_down[s], 0, HDIM * DIM * sizeof(float));
         }
 
+        for (int b = 0; b < batch_size; b++) {
+        int start = rand() % (tok.n_words - window);
+
         for (int s = 0; s < NSTEPS; s++) {
             int ctx_n_words = s + 1;  /* number of context words */
             int target = tok.word_ids[start + s + 1];
+            if (target < 0) continue;  /* unknown word — skip as target, but was in context */
             StepWeights *sw = &m->steps[s];
 
             /* collect BPE tokens from context words */
@@ -3003,11 +3008,11 @@ static void train(Model *m, const char *data_path, int train_steps, float lr) {
                     g_embed_out[v * DIM + j] += d_logits[v] * out[j];
             }
 
-            /* backprop through w_down */
+            /* backprop through w_down: w_down is [DIM x HDIM], stride HDIM */
             matmul_mtv(sw->w_down, d_out, d_swiglu, DIM, HDIM);
-            for (int i = 0; i < HDIM; i++)
-                for (int j = 0; j < DIM; j++)
-                    g_down[s][i * DIM + j] += swiglu[i] * d_out[j];
+            for (int i = 0; i < DIM; i++)
+                for (int j = 0; j < HDIM; j++)
+                    g_down[s][i * HDIM + j] += d_out[i] * swiglu[j];
 
             /* backprop through SwiGLU */
             for (int i = 0; i < HDIM; i++) {
@@ -3023,14 +3028,29 @@ static void train(Model *m, const char *data_path, int train_steps, float lr) {
                 }
             }
 
-            /* d_query (approx RMSNorm backward) */
+            /* d_query_n: residual path + SwiGLU path */
+            float d_qn[DIM];
+            memcpy(d_qn, d_out, DIM * sizeof(float)); /* residual */
+            /* add SwiGLU contribution: w_gate^T @ d_gate + w_up^T @ d_up */
+            for (int i = 0; i < HDIM; i++) {
+                float sg = siluf(gate[i]);
+                float sig = (gate[i] > -20) ? 1.0f / (1.0f + expf(-gate[i])) : 0;
+                float silu_grad = (gate[i] > -20) ? sig * (1.0f + gate[i] * (1.0f - sig)) : 0;
+                float d_gate_i = d_swiglu[i] * up[i] * silu_grad;
+                float d_up_i = d_swiglu[i] * sg;
+                for (int j = 0; j < DIM; j++) {
+                    d_qn[j] += sw->w_gate[i * DIM + j] * d_gate_i;
+                    d_qn[j] += sw->w_up[i * DIM + j] * d_up_i;
+                }
+            }
+            /* RMSNorm backward */
             float ss = 0;
             for (int i = 0; i < DIM; i++) ss += query[i] * query[i];
             ss = ss / DIM + 1e-5f;
             float inv = 1.0f / sqrtf(ss);
             float d_query[DIM];
             for (int i = 0; i < DIM; i++)
-                d_query[i] = d_out[i] * sw->rms[i] * inv;
+                d_query[i] = d_qn[i] * sw->rms[i] * inv;
 
             /* accumulate Wr gradient and get d_ctx */
             pool_context(m, ctx_bpe, bpe_n, ctx);
@@ -3050,6 +3070,19 @@ static void train(Model *m, const char *data_path, int train_steps, float lr) {
                 for (int j = 0; j < DIM; j++)
                     g_embed_in[ctx_bpe[i] * DIM + j] += d_ctx[j] * inv_n;
         }
+        } /* end batch loop */
+
+        /* divide gradients by batch_size */
+        float inv_bs = 1.0f / batch_size;
+        for (int i = 0; i < BPE_VOCAB * DIM; i++) g_embed_in[i] *= inv_bs;
+        for (int i = 0; i < NWORDS * DIM; i++) g_embed_out[i] *= inv_bs;
+        for (int s = 0; s < NSTEPS; s++) {
+            for (int i = 0; i < DIM * DIM; i++) g_wr[s][i] *= inv_bs;
+            for (int i = 0; i < DIM * HDIM; i++) { g_gate[s][i] *= inv_bs; g_up[s][i] *= inv_bs; }
+            for (int i = 0; i < HDIM * DIM; i++) g_down[s][i] *= inv_bs;
+        }
+
+        total_loss /= batch_size;
 
         /* ═══ Adam step (Chuck optimizer) ═══ */
         m->adam_t++;
