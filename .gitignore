@@ -9,6 +9,7 @@ test/test_penelope_zig
 test/test_penelope_aml
 *.o
 *.bin
+!weights/*.bin
 penelope_rs
 __pycache__/
 node_modules/

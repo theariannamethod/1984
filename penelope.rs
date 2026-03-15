@@ -1,25 +1,23 @@
-// penelope.rs — 1984 words. 12 steps of resonance. Dario Equation.
+// penelope.rs -- v7 Resonance engine. 1984 words. Dario Equation.
 //
-// Trainable resonance engine in Rust. Not a transformer. A mirror that learns.
+// 8-layer sequential transformer with multi-head attention, RoPE,
+// RRPRAM resonance gates, and SwiGLU FFN. Dual tokenizer:
+// BPE input (2048 subwords), word-level output (1984 words).
 //
-// Input:  text → BPE subword tokens (2048-token byte-pair encoding)
-// Attend: RRPRAM resonance + SwiGLU per step (how it thinks)
-// Output: word-level from 1984 vocab (gibberish impossible)
+// Architecture per layer l:
+//     h = rmsnorm(x, attn_norm_l)
+//     qkv_out = MultiHeadAttention(h; wq_l, wk_l, wv_l, wo_l, RoPE)
+//     rrp = h @ wr_l                            RRPRAM resonance
+//     gate = softmax(gate_l[0], gate_l[1])
+//     x = x + gate[0]*qkv_out + gate[1]*rrp    gated residual
+//     h2 = rmsnorm(x, ffn_norm_l)
+//     x = x + SwiGLU(h2; w_gate_l, w_up_l, w_down_l)  residual
 //
-// 12 learned step-weights (~1.03M each). Each step has its own lens.
-// Step 1 sees the surface. Step 12 sees the bone.
+// After 8 layers:
+//     logits = rmsnorm(x, final_norm) @ lm_head^T
+//     word_score(w) = mean(logits[bpe_tokens(w)]) + DarioField
 //
-// Architecture per step s:
-//     context = pool(embed_in(BPE tokens))
-//     query   = RMSNorm(context @ Wr_s)          RRPRAM resonance
-//     hidden  = SwiGLU(query; gate_s, up_s, down_s)
-//     logits  = (query + hidden) @ E_out^T        separate output embed
-//     logits += DarioField(context)               live overlay
-//     word    = sample(softmax(logits))
-//
-// Total: ~14M params (786K embed_in + 762K embed_out + 12 × 1.03M steps)
-//
-//   score(w) = B + α·H + β·F + γ·A + T      (Dario Equation)
+//   score(w) = B + alpha*H + beta*F + gamma*A + T   (Dario Equation)
 //
 //   rustc -O penelope.rs -o penelope_rs
 //   ./penelope_rs                                  # interactive
@@ -29,21 +27,26 @@
 //   ./penelope_rs --load penelope.bin              # load weights
 //   ./penelope_rs --save penelope.bin              # save after
 //
-// By Arianna Method. הרזוננס לא נשבר
+// By Arianna Method.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::convert::TryInto;
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, Write};
 
+const DIM: usize = 448;
+const HDIM: usize = 896;       // DIM * 2, SwiGLU hidden
+const N_HEADS: usize = 7;
+const HEAD_DIM: usize = 64;    // DIM / N_HEADS
+const N_LAYERS: usize = 8;     // sequential transformer layers
+const MAX_SEQ: usize = 256;
 const NWORDS: usize = 1984;
-const NSTEPS: usize = 12;
-const DIM: usize = 384;
-const HDIM: usize = 768;
 const BPE_VOCAB: usize = 2048;
 const BPE_MERGES: usize = 1792;
 const MAX_BPE_SEQ: usize = 16384;
+const GEN_STEPS: usize = 12;
 
 // ═══════════════════════════════════════════════════════════════
 // BPE MERGE TABLE — 1792 merges, learned from English text
@@ -630,7 +633,7 @@ fn matmul_mtv(w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     out
 }
 
-fn rmsnorm(x: &[f32], g: &[f32]) -> Vec<f32> {
+fn rmsnorm_slice(x: &[f32], g: &[f32]) -> Vec<f32> {
     let n = x.len();
     let ss: f32 = x.iter().map(|v| v * v).sum::<f32>() / n as f32 + 1e-5;
     let inv = 1.0 / ss.sqrt();
@@ -638,202 +641,349 @@ fn rmsnorm(x: &[f32], g: &[f32]) -> Vec<f32> {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// MODEL — 12 step-specific weight sets + split embeddings
+// MODEL -- v7 Resonance: 8 sequential layers with
+// multi-head attention + RoPE + RRPRAM resonance gate + SwiGLU
 // ═══════════════════════════════════════════════════════════════
 
-struct StepWeights {
-    wr: Vec<f32>,      // [DIM*DIM]
-    rms: Vec<f32>,     // [DIM]
-    w_gate: Vec<f32>,  // [DIM*HDIM]
-    w_up: Vec<f32>,    // [DIM*HDIM]
-    w_down: Vec<f32>,  // [HDIM*DIM]
+struct LayerWeights {
+    attn_norm: Vec<f32>, // [DIM]         pre-attention RMSNorm
+    wq: Vec<f32>,        // [DIM * DIM]   query projection
+    wk: Vec<f32>,        // [DIM * DIM]   key projection
+    wv: Vec<f32>,        // [DIM * DIM]   value projection
+    wo: Vec<f32>,        // [DIM * DIM]   output projection
+    wr: Vec<f32>,        // [DIM * DIM]   RRPRAM resonance
+    gate: [f32; 2],      // blend QKV + RRPRAM
+    ffn_norm: Vec<f32>,  // [DIM]         pre-FFN RMSNorm
+    w_gate: Vec<f32>,    // [DIM * HDIM]  SwiGLU gate (HDIM > DIM)
+    w_up: Vec<f32>,      // [DIM * HDIM]  SwiGLU up
+    w_down: Vec<f32>,    // [HDIM * DIM]  SwiGLU down
 }
 
-impl StepWeights {
+impl LayerWeights {
     fn new(rng: &mut Rng) -> Self {
         let sd = (2.0f32 / DIM as f32).sqrt();
-        let sm = (2.0f32 / HDIM as f32).sqrt();
-        StepWeights {
-            wr:     (0..DIM*DIM).map(|_| rng.randn() * sd).collect(),
-            rms:    vec![1.0; DIM],
-            w_gate: (0..DIM*HDIM).map(|_| rng.randn() * sd).collect(),
-            w_up:   (0..DIM*HDIM).map(|_| rng.randn() * sd).collect(),
-            w_down: (0..HDIM*DIM).map(|_| rng.randn() * sm).collect(),
+        let sh = (2.0f32 / HDIM as f32).sqrt();
+        LayerWeights {
+            attn_norm: vec![1.0; DIM],
+            wq:        (0..DIM*DIM).map(|_| rng.randn() * sd).collect(),
+            wk:        (0..DIM*DIM).map(|_| rng.randn() * sd).collect(),
+            wv:        (0..DIM*DIM).map(|_| rng.randn() * sd).collect(),
+            wo:        (0..DIM*DIM).map(|_| rng.randn() * sd).collect(),
+            wr:        (0..DIM*DIM).map(|_| rng.randn() * sd).collect(),
+            gate:      [0.0, 0.0],
+            ffn_norm:  vec![1.0; DIM],
+            w_gate:    (0..DIM*HDIM).map(|_| rng.randn() * sd).collect(),
+            w_up:      (0..DIM*HDIM).map(|_| rng.randn() * sd).collect(),
+            w_down:    (0..HDIM*DIM).map(|_| rng.randn() * sh).collect(),
         }
     }
 
     fn param_count() -> usize {
-        DIM*DIM + DIM + DIM*HDIM + DIM*HDIM + HDIM*DIM
+        // attn_norm + wq + wk + wv + wo + wr + gate + ffn_norm + w_gate + w_up + w_down
+        DIM + DIM*DIM*5 + 2 + DIM + DIM*HDIM*2 + HDIM*DIM
     }
 }
 
 struct Penelope {
-    embed_in: Vec<f32>,   // [BPE_VOCAB*DIM]  input BPE embedding
-    embed_out: Vec<f32>,  // [NWORDS*DIM]     output word embedding
-    steps: Vec<StepWeights>,
+    // Global weights
+    tok_emb: Vec<f32>,     // [BPE_VOCAB * DIM]  token embedding
+    pos_emb: Vec<f32>,     // [MAX_SEQ * DIM]    positional embedding
+    final_norm: Vec<f32>,  // [DIM]              final RMSNorm
+    lm_head: Vec<f32>,     // [BPE_VOCAB * DIM]  language model head
+    // Per-layer
+    layers: Vec<LayerWeights>,
 }
 
 impl Penelope {
     fn new(rng: &mut Rng) -> Self {
-        let sb = (2.0f32 / BPE_VOCAB as f32).sqrt();
-        let sv = (2.0f32 / NWORDS as f32).sqrt();
+        let scale_d = (2.0f32 / DIM as f32).sqrt();
+        let scale_bpe = (2.0f32 / BPE_VOCAB as f32).sqrt();
         Penelope {
-            embed_in:  (0..BPE_VOCAB*DIM).map(|_| rng.randn() * sb).collect(),
-            embed_out: (0..NWORDS*DIM).map(|_| rng.randn() * sv).collect(),
-            steps: (0..NSTEPS).map(|_| StepWeights::new(rng)).collect(),
+            tok_emb:    (0..BPE_VOCAB*DIM).map(|_| rng.randn() * scale_bpe).collect(),
+            pos_emb:    (0..MAX_SEQ*DIM).map(|_| rng.randn() * 0.02).collect(),
+            final_norm: vec![1.0; DIM],
+            lm_head:    (0..BPE_VOCAB*DIM).map(|_| rng.randn() * scale_d).collect(),
+            layers:     (0..N_LAYERS).map(|_| LayerWeights::new(rng)).collect(),
         }
     }
 
     fn param_count() -> usize {
-        BPE_VOCAB * DIM + NWORDS * DIM + NSTEPS * StepWeights::param_count()
+        let global = BPE_VOCAB * DIM + MAX_SEQ * DIM + DIM + BPE_VOCAB * DIM;
+        global + N_LAYERS * LayerWeights::param_count()
     }
 
-    fn pool_context(&self, bpe_ids: &[u16]) -> Vec<f32> {
-        let mut ctx = vec![0.0f32; DIM];
-        if bpe_ids.is_empty() { return ctx; }
-        for &id in bpe_ids {
-            let base = id as usize * DIM;
-            for j in 0..DIM { ctx[j] += self.embed_in[base + j]; }
-        }
-        let inv = 1.0 / bpe_ids.len() as f32;
-        for v in ctx.iter_mut() { *v *= inv; }
-        ctx
-    }
+    /// Full forward pass through all 8 layers for a sequence of BPE tokens.
+    /// Returns BPE logits [BPE_VOCAB] for the LAST token position.
+    fn forward(&self, bpe_ids: &[u16]) -> Vec<f32> {
+        let s = bpe_ids.len().max(1).min(MAX_SEQ);
+        let seq_len = s;
 
-    fn forward_step(&self, bpe_ids: &[u16], step: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
-        let sw = &self.steps[step];
-        let ctx = self.pool_context(bpe_ids);
+        // x: [S * DIM] -- residual stream
+        let mut x = vec![0.0f32; seq_len * DIM];
 
-        let query = matmul_mv(&sw.wr, &ctx, DIM, DIM);
-        let query_n = rmsnorm(&query, &sw.rms);
-        let gate = matmul_mv(&sw.w_gate, &query_n, HDIM, DIM);
-        let up = matmul_mv(&sw.w_up, &query_n, HDIM, DIM);
-        let swiglu: Vec<f32> = (0..HDIM).map(|i| silu(gate[i]) * up[i]).collect();
-        let hidden = matmul_mv(&sw.w_down, &swiglu, DIM, HDIM);
-        let out: Vec<f32> = (0..DIM).map(|i| query_n[i] + hidden[i]).collect();
-        let logits = matmul_mv(&self.embed_out, &out, NWORDS, DIM);
-
-        (logits, query, query_n, gate, up, swiglu, out)
-    }
-
-    /// Forward pass using BPE embed_in weights for word-level logits (trained mode).
-    /// For each word w, score = mean of dot(embed_in[bpe_tok], out) over the word's BPE tokens.
-    fn forward_step_trained(&self, bpe_ids: &[u16], step: usize, vocab_bpe: &[Vec<u16>])
-        -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)
-    {
-        let sw = &self.steps[step];
-        let ctx = self.pool_context(bpe_ids);
-
-        let query = matmul_mv(&sw.wr, &ctx, DIM, DIM);
-        let query_n = rmsnorm(&query, &sw.rms);
-        let gate = matmul_mv(&sw.w_gate, &query_n, HDIM, DIM);
-        let up = matmul_mv(&sw.w_up, &query_n, HDIM, DIM);
-        let swiglu: Vec<f32> = (0..HDIM).map(|i| silu(gate[i]) * up[i]).collect();
-        let hidden = matmul_mv(&sw.w_down, &swiglu, DIM, HDIM);
-        let out: Vec<f32> = (0..DIM).map(|i| query_n[i] + hidden[i]).collect();
-
-        let mut logits = vec![0.0f32; NWORDS];
-        for w in 0..NWORDS {
-            let bl = vocab_bpe[w].len();
-            let mut score = 0.0f32;
-            for &tok in &vocab_bpe[w] {
-                let mut dot = 0.0f32;
-                for j in 0..DIM {
-                    dot += self.embed_in[tok as usize * DIM + j] * out[j];
-                }
-                score += dot;
+        // embed: tok_emb + pos_emb
+        for t in 0..seq_len {
+            let tok = bpe_ids[t] as usize;
+            let tok = if tok >= BPE_VOCAB { 0 } else { tok };
+            for d in 0..DIM {
+                x[t * DIM + d] = self.tok_emb[tok * DIM + d] + self.pos_emb[t * DIM + d];
             }
-            logits[w] = if bl > 0 { score / bl as f32 } else { 0.0 };
         }
 
-        (logits, query, query_n, gate, up, swiglu, out)
+        // scratch buffers
+        let mut h   = vec![0.0f32; seq_len * DIM];
+        let mut q   = vec![0.0f32; seq_len * DIM];
+        let mut k   = vec![0.0f32; seq_len * DIM];
+        let mut v   = vec![0.0f32; seq_len * DIM];
+        let mut att = vec![0.0f32; seq_len * seq_len * N_HEADS];
+        let mut av  = vec![0.0f32; seq_len * DIM];
+        let mut qkv_out = vec![0.0f32; seq_len * DIM];
+        let mut rrp = vec![0.0f32; seq_len * DIM];
+        let mut h2  = vec![0.0f32; seq_len * DIM];
+        let mut fg  = vec![0.0f32; seq_len * HDIM];
+        let mut fu  = vec![0.0f32; seq_len * HDIM];
+        let mut sw  = vec![0.0f32; seq_len * HDIM];
+        let mut fd  = vec![0.0f32; seq_len * DIM];
+
+        for l in 0..N_LAYERS {
+            let lw = &self.layers[l];
+
+            // 1. h = rmsnorm(x, attn_norm) for each position
+            for t in 0..seq_len {
+                let hslice = rmsnorm_slice(&x[t*DIM..(t+1)*DIM], &lw.attn_norm);
+                h[t*DIM..(t+1)*DIM].copy_from_slice(&hslice);
+            }
+
+            // 2-3. q = h @ wq, k = h @ wk, v = h @ wv (per position)
+            for t in 0..seq_len {
+                let ht = &h[t*DIM..(t+1)*DIM];
+                let qt = matmul_mv(&lw.wq, ht, DIM, DIM);
+                let kt = matmul_mv(&lw.wk, ht, DIM, DIM);
+                let vt = matmul_mv(&lw.wv, ht, DIM, DIM);
+                q[t*DIM..(t+1)*DIM].copy_from_slice(&qt);
+                k[t*DIM..(t+1)*DIM].copy_from_slice(&kt);
+                v[t*DIM..(t+1)*DIM].copy_from_slice(&vt);
+            }
+
+            // Apply RoPE to q and k (layout: [S, N_HEADS, HEAD_DIM])
+            apply_rope(&mut q, &mut k, seq_len);
+
+            // 5. Multi-head causal attention: softmax(q @ k^T / sqrt(head_dim))
+            let scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
+            for hd in 0..N_HEADS {
+                for ti in 0..seq_len {
+                    let qi_off = (ti * N_HEADS + hd) * HEAD_DIM;
+                    let mut maxs = -1e30f32;
+                    for tj in 0..=ti {
+                        let kj_off = (tj * N_HEADS + hd) * HEAD_DIM;
+                        let mut dot = 0.0f32;
+                        for d in 0..HEAD_DIM {
+                            dot += q[qi_off + d] * k[kj_off + d];
+                        }
+                        dot *= scale;
+                        att[(hd * seq_len + ti) * seq_len + tj] = dot;
+                        if dot > maxs { maxs = dot; }
+                    }
+                    // softmax
+                    let mut sum = 0.0f32;
+                    for tj in 0..=ti {
+                        let val = (att[(hd * seq_len + ti) * seq_len + tj] - maxs).exp();
+                        att[(hd * seq_len + ti) * seq_len + tj] = val;
+                        sum += val;
+                    }
+                    let inv_s = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+                    for tj in 0..=ti {
+                        att[(hd * seq_len + ti) * seq_len + tj] *= inv_s;
+                    }
+                    for tj in (ti+1)..seq_len {
+                        att[(hd * seq_len + ti) * seq_len + tj] = 0.0;
+                    }
+                }
+            }
+
+            // 6. attn @ v, reshape, then @ wo
+            for val in av.iter_mut() { *val = 0.0; }
+            for hd in 0..N_HEADS {
+                for ti in 0..seq_len {
+                    let avi_off = (ti * N_HEADS + hd) * HEAD_DIM;
+                    for tj in 0..=ti {
+                        let a = att[(hd * seq_len + ti) * seq_len + tj];
+                        if a == 0.0 { continue; }
+                        let vj_off = (tj * N_HEADS + hd) * HEAD_DIM;
+                        for d in 0..HEAD_DIM {
+                            av[avi_off + d] += a * v[vj_off + d];
+                        }
+                    }
+                }
+            }
+            // av is [S, DIM] (concatenated heads). Project through wo
+            for t in 0..seq_len {
+                let out = matmul_mv(&lw.wo, &av[t*DIM..(t+1)*DIM], DIM, DIM);
+                qkv_out[t*DIM..(t+1)*DIM].copy_from_slice(&out);
+            }
+
+            // 7. RRPRAM resonance: rrp = h @ wr
+            for t in 0..seq_len {
+                let out = matmul_mv(&lw.wr, &h[t*DIM..(t+1)*DIM], DIM, DIM);
+                rrp[t*DIM..(t+1)*DIM].copy_from_slice(&out);
+            }
+
+            // 8. gate_weights = softmax(gate[0], gate[1])
+            let g0 = lw.gate[0];
+            let g1 = lw.gate[1];
+            let gmax = g0.max(g1);
+            let e0 = (g0 - gmax).exp();
+            let e1 = (g1 - gmax).exp();
+            let gsum = e0 + e1;
+            let w0 = e0 / gsum;
+            let w1 = e1 / gsum;
+
+            // 9. x = x + w0 * qkv_out + w1 * rrp (residual)
+            for i in 0..(seq_len * DIM) {
+                x[i] += w0 * qkv_out[i] + w1 * rrp[i];
+            }
+
+            // 10. h2 = rmsnorm(x, ffn_norm)
+            for t in 0..seq_len {
+                let h2slice = rmsnorm_slice(&x[t*DIM..(t+1)*DIM], &lw.ffn_norm);
+                h2[t*DIM..(t+1)*DIM].copy_from_slice(&h2slice);
+            }
+
+            // 11. SwiGLU FFN: x = x + w_down @ (silu(h2 @ w_gate) * (h2 @ w_up))
+            for t in 0..seq_len {
+                let h2t = &h2[t*DIM..(t+1)*DIM];
+                let fgt = matmul_mv(&lw.w_gate, h2t, HDIM, DIM);
+                let fut = matmul_mv(&lw.w_up, h2t, HDIM, DIM);
+                for i in 0..HDIM {
+                    fg[t*HDIM + i] = fgt[i];
+                    fu[t*HDIM + i] = fut[i];
+                    sw[t*HDIM + i] = silu(fgt[i]) * fut[i];
+                }
+                let fdt = matmul_mv(&lw.w_down, &sw[t*HDIM..(t+1)*HDIM], DIM, HDIM);
+                for d in 0..DIM {
+                    fd[t*DIM + d] = fdt[d];
+                    x[t*DIM + d] += fdt[d];
+                }
+            }
+        }
+
+        // After all layers: final rmsnorm + lm_head for LAST position
+        let xn = rmsnorm_slice(&x[(seq_len-1)*DIM..seq_len*DIM], &self.final_norm);
+        matmul_mv(&self.lm_head, &xn, BPE_VOCAB, DIM)
     }
 
     fn save(&self, path: &str) {
         let mut data: Vec<u8> = Vec::new();
-        // v2 header: magic, BPE_VOCAB, NWORDS, DIM, HDIM, NSTEPS (6 ints = 24 bytes)
-        let magic: u32 = 0x50454E32; // "PEN2"
-        for &v in &[magic, BPE_VOCAB as u32, NWORDS as u32, DIM as u32, HDIM as u32, NSTEPS as u32] {
-            data.extend_from_slice(&v.to_le_bytes());
-        }
-        for &v in &self.embed_in { data.extend_from_slice(&v.to_le_bytes()); }
-        for &v in &self.embed_out { data.extend_from_slice(&v.to_le_bytes()); }
-        for sw in &self.steps {
-            for &v in &sw.wr { data.extend_from_slice(&v.to_le_bytes()); }
-            for &v in &sw.rms { data.extend_from_slice(&v.to_le_bytes()); }
-            for &v in &sw.w_gate { data.extend_from_slice(&v.to_le_bytes()); }
-            for &v in &sw.w_up { data.extend_from_slice(&v.to_le_bytes()); }
-            for &v in &sw.w_down { data.extend_from_slice(&v.to_le_bytes()); }
+        // PEN7 header: magic, BPE_VOCAB, NWORDS, DIM, HDIM, N_HEADS, N_LAYERS, MAX_SEQ
+        let header: [u32; 8] = [
+            0x50454E37, BPE_VOCAB as u32, NWORDS as u32, DIM as u32,
+            HDIM as u32, N_HEADS as u32, N_LAYERS as u32, MAX_SEQ as u32,
+        ];
+        for &v in &header { data.extend_from_slice(&v.to_le_bytes()); }
+        // Global weights
+        for &v in &self.tok_emb { data.extend_from_slice(&v.to_le_bytes()); }
+        for &v in &self.pos_emb { data.extend_from_slice(&v.to_le_bytes()); }
+        for &v in &self.final_norm { data.extend_from_slice(&v.to_le_bytes()); }
+        for &v in &self.lm_head { data.extend_from_slice(&v.to_le_bytes()); }
+        // Per-layer weights
+        for lw in &self.layers {
+            for &v in &lw.attn_norm { data.extend_from_slice(&v.to_le_bytes()); }
+            for &v in &lw.wq { data.extend_from_slice(&v.to_le_bytes()); }
+            for &v in &lw.wk { data.extend_from_slice(&v.to_le_bytes()); }
+            for &v in &lw.wv { data.extend_from_slice(&v.to_le_bytes()); }
+            for &v in &lw.wo { data.extend_from_slice(&v.to_le_bytes()); }
+            for &v in &lw.wr { data.extend_from_slice(&v.to_le_bytes()); }
+            for &v in &lw.gate { data.extend_from_slice(&v.to_le_bytes()); }
+            for &v in &lw.ffn_norm { data.extend_from_slice(&v.to_le_bytes()); }
+            for &v in &lw.w_gate { data.extend_from_slice(&v.to_le_bytes()); }
+            for &v in &lw.w_up { data.extend_from_slice(&v.to_le_bytes()); }
+            for &v in &lw.w_down { data.extend_from_slice(&v.to_le_bytes()); }
         }
         fs::write(path, &data).expect("save failed");
-        let expected = 24 + Self::param_count() * 4;
+        let expected = 32 + Self::param_count() * 4;
         println!("  saved {}: {} params ({:.1}MB) [{}]", path, Self::param_count(),
                  data.len() as f64 / 1e6,
                  if data.len() == expected { "OK" } else { "SIZE MISMATCH!" });
     }
 
-    fn load(&mut self, path: &str, rng: &mut Rng) -> bool {
+    fn load(&mut self, path: &str) -> bool {
         let data = match fs::read(path) {
             Ok(d) => d,
             Err(e) => { eprintln!("  cannot open {}: {}", path, e); return false; }
         };
-        if data.len() < 24 { eprintln!("  file too small"); return false; }
+        if data.len() < 32 { eprintln!("  file too small"); return false; }
         let magic = u32::from_le_bytes(data[0..4].try_into().unwrap());
 
-        if magic == 0x50454E32 {
-            // v2 format
-            let bv = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
-            let v = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
-            let d = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
-            let h = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
-            let s = u32::from_le_bytes(data[20..24].try_into().unwrap()) as usize;
-            if bv != BPE_VOCAB || v != NWORDS || d != DIM || h != HDIM || s != NSTEPS {
-                eprintln!("  v2 config mismatch: BV={} V={} D={} M={} S={}", bv, v, d, h, s);
-                return false;
-            }
-            let floats: Vec<f32> = data[24..].chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
-            let mut o = 0;
-            self.embed_in = floats[o..o+BPE_VOCAB*DIM].to_vec(); o += BPE_VOCAB*DIM;
-            self.embed_out = floats[o..o+NWORDS*DIM].to_vec(); o += NWORDS*DIM;
-            for sw in &mut self.steps {
-                sw.wr = floats[o..o+DIM*DIM].to_vec(); o += DIM*DIM;
-                sw.rms = floats[o..o+DIM].to_vec(); o += DIM;
-                sw.w_gate = floats[o..o+DIM*HDIM].to_vec(); o += DIM*HDIM;
-                sw.w_up = floats[o..o+DIM*HDIM].to_vec(); o += DIM*HDIM;
-                sw.w_down = floats[o..o+HDIM*DIM].to_vec(); o += HDIM*DIM;
-            }
-            println!("  loaded v2 {}: {} params", path, Self::param_count());
-            return true;
-        }
-
-        // v1 format: magic was actually header[0]=NWORDS
-        if data.len() < 16 { eprintln!("  file too small for v1"); return false; }
-        let v = magic as usize;
-        let d = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
-        let h = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
-        let s = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
-        if v != NWORDS || d != DIM || h != HDIM || s != NSTEPS {
-            eprintln!("  v1 config mismatch: V={} D={} M={} S={}", v, d, h, s);
+        if magic != 0x50454E37 {
+            eprintln!("  unknown format magic=0x{:08X} (expected PEN7=0x50454E37)", magic);
             return false;
         }
-        let floats: Vec<f32> = data[16..].chunks_exact(4)
+        let bv = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+        let nw = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+        let d  = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
+        let hd = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
+        let nh = u32::from_le_bytes(data[20..24].try_into().unwrap()) as usize;
+        let nl = u32::from_le_bytes(data[24..28].try_into().unwrap()) as usize;
+        let ms = u32::from_le_bytes(data[28..32].try_into().unwrap()) as usize;
+        if bv != BPE_VOCAB || nw != NWORDS || d != DIM || hd != HDIM ||
+           nh != N_HEADS || nl != N_LAYERS || ms != MAX_SEQ {
+            eprintln!("  v7 config mismatch: BV={} V={} D={} H={} NH={} NL={} S={}",
+                      bv, nw, d, hd, nh, nl, ms);
+            return false;
+        }
+        let floats: Vec<f32> = data[32..].chunks_exact(4)
             .map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
         let mut o = 0;
-        // old embed -> embed_out, init embed_in randomly
-        self.embed_out = floats[o..o+NWORDS*DIM].to_vec(); o += NWORDS*DIM;
-        let sb = (2.0f32 / BPE_VOCAB as f32).sqrt();
-        self.embed_in = (0..BPE_VOCAB*DIM).map(|_| rng.randn() * sb).collect();
-        for sw in &mut self.steps {
-            sw.wr = floats[o..o+DIM*DIM].to_vec(); o += DIM*DIM;
-            sw.rms = floats[o..o+DIM].to_vec(); o += DIM;
-            sw.w_gate = floats[o..o+DIM*HDIM].to_vec(); o += DIM*HDIM;
-            sw.w_up = floats[o..o+DIM*HDIM].to_vec(); o += DIM*HDIM;
-            sw.w_down = floats[o..o+HDIM*DIM].to_vec(); o += HDIM*DIM;
+        // Global weights
+        self.tok_emb = floats[o..o+BPE_VOCAB*DIM].to_vec(); o += BPE_VOCAB*DIM;
+        self.pos_emb = floats[o..o+MAX_SEQ*DIM].to_vec(); o += MAX_SEQ*DIM;
+        self.final_norm = floats[o..o+DIM].to_vec(); o += DIM;
+        self.lm_head = floats[o..o+BPE_VOCAB*DIM].to_vec(); o += BPE_VOCAB*DIM;
+        // Per-layer
+        for lw in &mut self.layers {
+            lw.attn_norm = floats[o..o+DIM].to_vec(); o += DIM;
+            lw.wq = floats[o..o+DIM*DIM].to_vec(); o += DIM*DIM;
+            lw.wk = floats[o..o+DIM*DIM].to_vec(); o += DIM*DIM;
+            lw.wv = floats[o..o+DIM*DIM].to_vec(); o += DIM*DIM;
+            lw.wo = floats[o..o+DIM*DIM].to_vec(); o += DIM*DIM;
+            lw.wr = floats[o..o+DIM*DIM].to_vec(); o += DIM*DIM;
+            lw.gate = [floats[o], floats[o+1]]; o += 2;
+            lw.ffn_norm = floats[o..o+DIM].to_vec(); o += DIM;
+            lw.w_gate = floats[o..o+DIM*HDIM].to_vec(); o += DIM*HDIM;
+            lw.w_up = floats[o..o+DIM*HDIM].to_vec(); o += DIM*HDIM;
+            lw.w_down = floats[o..o+HDIM*DIM].to_vec(); o += HDIM*DIM;
         }
-        println!("  WARNING: migrated v1 weights -> v2 (embed_in initialized randomly)");
-        println!("  loaded v1 {}: {} params (embed_out from v1, embed_in new)", path, Self::param_count());
+        println!("  loaded v7 {}: {} params ({:.1}MB)", path, Self::param_count(),
+                 Self::param_count() as f64 * 4.0 / 1e6);
         true
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ROPE -- rotary position embedding
+// ═══════════════════════════════════════════════════════════════
+
+fn apply_rope(q: &mut [f32], k: &mut [f32], seq_len: usize) {
+    let theta_base: f32 = 10000.0;
+    for t in 0..seq_len {
+        for h in 0..N_HEADS {
+            let base = (t * N_HEADS + h) * HEAD_DIM;
+            for d in 0..(HEAD_DIM / 2) {
+                let freq = 1.0 / theta_base.powf(2.0 * d as f32 / HEAD_DIM as f32);
+                let cos_f = (t as f32 * freq).cos();
+                let sin_f = (t as f32 * freq).sin();
+                // rotate q
+                let q0 = q[base + d];
+                let q1 = q[base + d + HEAD_DIM/2];
+                q[base + d]              = q0 * cos_f - q1 * sin_f;
+                q[base + d + HEAD_DIM/2] = q0 * sin_f + q1 * cos_f;
+                // rotate k
+                let k0 = k[base + d];
+                let k1 = k[base + d + HEAD_DIM/2];
+                k[base + d]              = k0 * cos_f - k1 * sin_f;
+                k[base + d + HEAD_DIM/2] = k0 * sin_f + k1 * cos_f;
+            }
+        }
     }
 }
 
@@ -1002,7 +1152,7 @@ impl DarioField {
     }
 
     fn update_chambers(&mut self, step: usize) {
-        let depth = step as f32 / NSTEPS as f32;
+        let depth = step as f32 / N_LAYERS as f32;
         let phase = if depth < 0.33 { 0 } else if depth < 0.66 { 1 } else { 2 };
         if phase == 0 { self.chambers[4] += 0.05; }
         if phase == 1 { self.chambers[0] += 0.04; }
@@ -1049,185 +1199,100 @@ impl DarioField {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// TRAINING
+// BPE LOGITS TO WORD SCORES
+// word_score(w) = mean(bpe_logits[tok] for tok in word's BPE tokens)
 // ═══════════════════════════════════════════════════════════════
 
-/// Dual tokenization for training: each word gets both a vocab ID and BPE tokens.
-struct TrainTokens {
-    word_ids: Vec<usize>,        // 1984-vocab ID per word
-    bpe_flat: Vec<u16>,          // all BPE tokens concatenated
-    bpe_offset: Vec<usize>,      // start index in bpe_flat for each word
-    bpe_len: Vec<usize>,         // number of BPE tokens per word
-}
-
-fn tokenize_for_training(text: &str, idx: &HashMap<String, usize>) -> TrainTokens {
-    let mut t = TrainTokens {
-        word_ids: Vec::new(), bpe_flat: Vec::new(),
-        bpe_offset: Vec::new(), bpe_len: Vec::new(),
-    };
-    let lower = text.to_lowercase();
-    for word in lower.split(|c: char| !c.is_alphabetic()) {
-        if word.len() < 2 || is_stop(word) { continue; }
-
-        // get vocab ID
-        let vid = if let Some(&i) = idx.get(word) { Some(i) }
-            else if let Some(i) = try_stem(word, idx) { Some(i) }
-            else {
-                let subs = greedy_vocab_match(word, idx);
-                if !subs.is_empty() { Some(subs[0]) } else { None }
-            };
-        let vid = match vid { Some(v) => v, None => continue };
-
-        // get BPE encoding of the word
-        let bpe_ids = bpe_encode(word);
-        let off = t.bpe_flat.len();
-        t.word_ids.push(vid);
-        t.bpe_offset.push(off);
-        t.bpe_len.push(bpe_ids.len());
-        t.bpe_flat.extend_from_slice(&bpe_ids);
+fn bpe_logits_to_word_scores(bpe_logits: &[f32], vocab_bpe: &[Vec<u16>]) -> Vec<f32> {
+    let mut scores = vec![0.0f32; NWORDS];
+    for w in 0..NWORDS {
+        let bl = vocab_bpe[w].len();
+        let mut score = 0.0f32;
+        for &tok in &vocab_bpe[w] {
+            let t = tok as usize;
+            if t < BPE_VOCAB { score += bpe_logits[t]; }
+        }
+        scores[w] = if bl > 0 { score / bl as f32 } else { 0.0 };
     }
-    t
+    scores
 }
+
+// ═══════════════════════════════════════════════════════════════
+// TRAINING -- BPE-level next-token prediction
+// ═══════════════════════════════════════════════════════════════
 
 fn train(model: &mut Penelope, data_path: &str, steps: usize, lr: f32) {
     let text = match fs::read_to_string(data_path) {
         Ok(t) => t,
         Err(e) => { eprintln!("  cannot open {}: {}", data_path, e); return; }
     };
-    let idx = build_vocab_idx();
-    let tok = tokenize_for_training(&text, &idx);
-    let window = NSTEPS + 1;
-    if tok.word_ids.len() < window + 1 {
-        eprintln!("  corpus too small: {} words (need {}+)", tok.word_ids.len(), window + 1);
+
+    // BPE tokenize entire corpus
+    let corpus_bpe = bpe_encode(&text);
+    if corpus_bpe.len() < MAX_SEQ + 1 {
+        eprintln!("  corpus too small: {} BPE tokens (need {}+)", corpus_bpe.len(), MAX_SEQ + 1);
         return;
     }
 
-    println!("  corpus: {} bytes -> {} vocab words", text.len(), tok.word_ids.len());
+    println!("  corpus: {} bytes -> {} BPE tokens", text.len(), corpus_bpe.len());
     println!("  model: {} params ({:.1}MB f32)", Penelope::param_count(),
              Penelope::param_count() as f64 * 4.0 / 1e6);
-    println!("  training: {} steps, lr={:.1e}", steps, lr);
+    println!("  architecture: {} layers, {} heads, dim={}, hdim={}", N_LAYERS, N_HEADS, DIM, HDIM);
+    println!("  training: {} steps, lr={:.1e}, seq={}", steps, lr, MAX_SEQ);
+    println!("  NOTE: Rust trainer uses forward-only loss (for full training, export weights)");
 
     let mut rng = Rng::new(42);
     let mut best_loss = f32::INFINITY;
 
     for step in 1..=steps {
-        let start = rng.randint(tok.word_ids.len() - window);
+        // Sample a random window from corpus
+        let seq_len = MAX_SEQ.min(corpus_bpe.len() - 1);
+        let start = rng.randint(corpus_bpe.len() - seq_len);
+        let ctx = &corpus_bpe[start..start + seq_len];
+        let target = corpus_bpe[start + seq_len] as usize;
 
-        let mut total_loss = 0.0f32;
+        // Forward pass: predict next token from context
+        let logits = model.forward(ctx);
+        let probs = softmax(&logits);
 
-        for s in 0..NSTEPS {
-            let ctx_n_words = s + 1;
-            let target = tok.word_ids[start + s + 1];
+        let p = probs[if target < BPE_VOCAB { target } else { 0 }].max(1e-10);
+        let loss = -p.ln();
 
-            // collect BPE tokens from context words
-            let mut ctx_bpe: Vec<u16> = Vec::new();
-            for w in 0..ctx_n_words {
-                let wi = start + w;
-                let off = tok.bpe_offset[wi];
-                let bl = tok.bpe_len[wi];
-                ctx_bpe.extend_from_slice(&tok.bpe_flat[off..off+bl]);
-            }
-
-            let (logits, query, query_n, gate, up, swiglu, out) = model.forward_step(&ctx_bpe, s);
-            let probs = softmax(&logits);
-            let p = probs[target].max(1e-10);
-            total_loss -= p.ln();
-
-            // d_logits = probs - one_hot
-            let mut d_logits = probs.clone();
-            d_logits[target] -= 1.0;
-
-            // d_out from embed_out (separate output embed)
-            let mut d_out = vec![0.0f32; DIM];
-            for v in 0..NWORDS {
-                if d_logits[v].abs() < 1e-8 { continue; }
-                for j in 0..DIM {
-                    d_out[j] += d_logits[v] * model.embed_out[v * DIM + j];
-                }
-            }
-
-            // update embed_out
-            for v in 0..NWORDS {
-                if d_logits[v].abs() < 1e-8 { continue; }
-                for j in 0..DIM {
-                    model.embed_out[v * DIM + j] -= lr * d_logits[v] * out[j];
-                }
-            }
-
-            // pre-compute context for Wr update
-            let ctx = model.pool_context(&ctx_bpe);
-
-            // approx RMSNorm backward
-            let ss_q: f32 = query.iter().map(|v| v * v).sum::<f32>() / DIM as f32 + 1e-5;
-            let inv_q = 1.0 / ss_q.sqrt();
-            let rms_copy: Vec<f32> = model.steps[s].rms.clone();
-            let d_query: Vec<f32> = (0..DIM).map(|i| d_out[i] * rms_copy[i] * inv_q).collect();
-
-            let d_swiglu = matmul_mtv(&model.steps[s].w_down, &d_out, DIM, HDIM);
-
-            // d_ctx for embed_in gradient
-            let mut d_ctx = vec![0.0f32; DIM];
-            for i in 0..DIM {
-                if d_query[i].abs() < 1e-8 { continue; }
-                for j in 0..DIM {
-                    d_ctx[j] += d_query[i] * model.steps[s].wr[i * DIM + j];
-                }
-            }
-
-            let sw = &mut model.steps[s];
-
-            // backprop w_down
-            for i in 0..HDIM {
-                for j in 0..DIM {
-                    sw.w_down[i * DIM + j] -= lr * swiglu[i] * d_out[j];
-                }
-            }
-
-            // backprop SwiGLU
-            for i in 0..HDIM {
-                let sg = silu(gate[i]);
-                let sig = if gate[i] > -20.0 { 1.0 / (1.0 + (-gate[i]).exp()) } else { 0.0 };
-                let silu_grad = if gate[i] > -20.0 { sig * (1.0 + gate[i] * (1.0 - sig)) } else { 0.0 };
-                let d_gate_i = d_swiglu[i] * up[i] * silu_grad;
-                let d_up_i = d_swiglu[i] * sg;
-                for j in 0..DIM {
-                    sw.w_gate[i * DIM + j] -= lr * d_gate_i * query_n[j];
-                    sw.w_up[i * DIM + j] -= lr * d_up_i * query_n[j];
-                }
-            }
-
-            // update Wr
-            for i in 0..DIM {
-                if d_query[i].abs() < 1e-8 { continue; }
-                for j in 0..DIM {
-                    sw.wr[i * DIM + j] -= lr * d_query[i] * ctx[j];
-                }
-            }
-
-            // backprop d_ctx through pool_context to embed_in
-            let bpe_n = ctx_bpe.len();
-            let inv_n = 1.0 / (if bpe_n > 0 { bpe_n } else { 1 }) as f32;
-            for &bid in &ctx_bpe {
-                let base = bid as usize * DIM;
-                for j in 0..DIM {
-                    model.embed_in[base + j] -= lr * d_ctx[j] * inv_n;
-                }
-            }
-        }
-
-        let avg_loss = total_loss / NSTEPS as f32;
-        if avg_loss < best_loss { best_loss = avg_loss; }
+        if loss < best_loss { best_loss = loss; }
 
         if step % 50 == 0 || step == 1 {
-            println!("  step {:5}/{} loss={:.4} best={:.4}", step, steps, avg_loss, best_loss);
+            println!("  step {:5}/{} loss={:.4} best={:.4} (target={} p={:.4})",
+                     step, steps, loss, best_loss, target, p);
+        }
+
+        // Shallow gradient: nudge tok_emb for target toward context average
+        let scale = lr * 0.1;
+        let n_ctx = seq_len.min(8);
+        for d in 0..DIM {
+            let mut avg_ctx = 0.0f32;
+            for i in (seq_len - n_ctx)..seq_len {
+                avg_ctx += model.tok_emb[ctx[i] as usize * DIM + d];
+            }
+            avg_ctx /= n_ctx as f32;
+            let tidx = if target < BPE_VOCAB { target } else { 0 };
+            model.tok_emb[tidx * DIM + d] += scale * (avg_ctx - model.tok_emb[tidx * DIM + d]);
         }
     }
 
     println!("  training complete. best loss: {:.4}", best_loss);
+    println!("  NOTE: for full training, use PyTorch with PEN7 weight export");
 }
 
 // ═══════════════════════════════════════════════════════════════
-// GENERATION
+// GENERATION -- autoregressive BPE, then word-level output
+//
+// Dual tokenizer: soul thinks in BPE (2048), mouth speaks in words (1984).
+// At each step:
+//   1. Forward pass -> BPE logits
+//   2. Compute word scores = mean(logits for word's BPE tokens)
+//   3. Apply Dario overlay on word scores
+//   4. Sample word, print it
+//   5. Append word's BPE tokens to context for next step
 // ═══════════════════════════════════════════════════════════════
 
 fn find_seed(key: &str, idx: &HashMap<String, usize>, rng: &mut Rng) -> usize {
@@ -1261,11 +1326,12 @@ fn init_vocab_bpe() -> Vec<Vec<u16>> {
 }
 
 fn run_chain(model: &Penelope, field: &mut DarioField, text: &str, rng: &mut Rng,
-             vocab_bpe: &[Vec<u16>], has_weights: bool) {
+             vocab_bpe: &[Vec<u16>], _has_weights: bool) {
     let idx = build_vocab_idx();
     let key = extract_key(text);
     let seed = find_seed(&key, &idx, rng);
 
+    // prophecy
     let deep_cats = [2, 5, 7];
     let tcat = deep_cats[rng.randint(3)];
     let ranges = [(0,100),(100,200),(200,300),(300,350),(350,450),(450,550),(550,650),(650,NWORDS)];
@@ -1276,30 +1342,39 @@ fn run_chain(model: &Penelope, field: &mut DarioField, text: &str, rng: &mut Rng
     println!("\n  destined: {}", vocab_display(field.prophecy_target.unwrap()));
     println!("\n  {}", vocab_display(seed));
 
-    let mut chain = vec![seed];
-    let mut forbidden = std::collections::HashSet::new();
+    let mut chain: Vec<usize> = vec![seed];
+    let mut forbidden = HashSet::new();
     forbidden.insert(seed);
 
-    // BPE token buffer for context — grows as words are added
+    // BPE context buffer -- starts with seed word's BPE tokens
     let mut bpe_buf: Vec<u16> = vocab_bpe[seed].clone();
 
     let mut fulfilled = false;
 
-    for step in 0..NSTEPS {
+    for step in 0..GEN_STEPS {
         field.update_chambers(step);
         field.prophecy_age += 1;
 
-        let (mut logits, _, _, _, _, _, _) = if has_weights {
-            model.forward_step_trained(&bpe_buf, step, vocab_bpe)
-        } else {
-            model.forward_step(&bpe_buf, step)
-        };
-        field.overlay(&mut logits, &chain);
+        // 1. Forward pass through all 8 layers -> BPE logits for last position
+        let ctx_len = bpe_buf.len().min(MAX_SEQ);
+        let ctx_start = if bpe_buf.len() > MAX_SEQ { bpe_buf.len() - MAX_SEQ } else { 0 };
+        let bpe_logits = model.forward(&bpe_buf[ctx_start..ctx_start+ctx_len]);
 
-        for &f in &forbidden { logits[f] = -1e9; }
+        // 2. Convert BPE logits to word-level scores
+        let mut word_scores = bpe_logits_to_word_scores(&bpe_logits, vocab_bpe);
 
-        let probs = softmax(&logits);
-        let mut top: Vec<(usize, f32)> = probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
+        // 3. Dario overlay on word scores
+        field.overlay(&mut word_scores, &chain);
+
+        // mask forbidden
+        for &f in &forbidden {
+            if f < NWORDS { word_scores[f] = -1e9; }
+        }
+
+        // top-k=12 sampling
+        let probs = softmax(&word_scores);
+        let mut top: Vec<(usize, f32)> = probs.iter().enumerate()
+            .map(|(i, &p)| (i, p)).collect();
         top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         top.truncate(12);
 
@@ -1314,29 +1389,29 @@ fn run_chain(model: &Penelope, field: &mut DarioField, text: &str, rng: &mut Rng
         chain.push(pick);
         forbidden.insert(pick);
 
-        // append picked word's BPE tokens to buffer
-        if bpe_buf.len() + vocab_bpe[pick].len() < MAX_BPE_SEQ {
+        // append picked word's BPE tokens to context
+        if pick < NWORDS && bpe_buf.len() + vocab_bpe[pick].len() < MAX_BPE_SEQ {
             bpe_buf.extend_from_slice(&vocab_bpe[pick]);
         }
 
+        // Dario field updates
         if chain.len() >= 2 {
             field.update_cooc(chain[chain.len()-2], pick);
         }
         let cat = word_category(pick);
         field.destiny[cat] = 0.3 + 0.7 * field.destiny[cat];
-
         if Some(pick) == field.prophecy_target { fulfilled = true; }
         if step > 7 { field.trauma = (field.trauma + 0.1).min(1.0); }
         field.trauma *= 0.97;
 
-        if step == NSTEPS - 1 {
+        if step == GEN_STEPS - 1 {
             println!("  *{}", vocab_display(pick));
         } else {
             println!("   {}", vocab_display(pick));
         }
     }
 
-    let cats: std::collections::HashSet<usize> = chain.iter().map(|&w| word_category(w)).collect();
+    let cats: HashSet<usize> = chain.iter().map(|&w| word_category(w)).collect();
     println!("\n  drift {}/8 \u{00b7} prophecy {}",
              cats.len(), if fulfilled { "fulfilled" } else { "unfulfilled" });
 }
@@ -1372,13 +1447,15 @@ fn main() {
     let mut model = Penelope::new(&mut rng);
 
     println!();
-    println!("  penelope \u{2014} 1984 words, {} steps, Dario Equation", NSTEPS);
+    println!("  penelope v7 \u{2014} Resonance engine. 1984 words. Dario Equation.");
+    println!("  {} layers, {} heads, dim={}, hdim={}", N_LAYERS, N_HEADS, DIM, HDIM);
     println!("  {} trainable params ({:.1}MB f32)", Penelope::param_count(),
              Penelope::param_count() as f64 * 4.0 / 1e6);
+    println!("  BPE input: {} subword tokens, max_seq={}", BPE_VOCAB, MAX_SEQ);
     println!("  by Arianna Method");
     println!();
 
-    let has_weights = if let Some(ref path) = load_path { model.load(path, &mut rng) } else { false };
+    let has_weights = if let Some(ref path) = load_path { model.load(path) } else { false };
     if let Some(ref path) = train_path {
         train(&mut model, path, train_steps, lr);
         if let Some(ref sp) = save_path { model.save(sp); }
@@ -1386,6 +1463,8 @@ fn main() {
 
     let vocab_bpe = init_vocab_bpe();
     let mut field = DarioField::new();
+
+    println!("  mode: {}\n", if has_weights { "trained (BPE word scores)" } else { "weightless (word-level)" });
 
     if let Some(ref t) = text {
         run_chain(&model, &mut field, t, &mut rng, &vocab_bpe, has_weights);

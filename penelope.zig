@@ -1,39 +1,43 @@
-// penelope.zig — 1984 words. 12 steps of resonance. Dario Equation.
+// penelope.zig — v7 Resonance engine. 1984 words. Dario Equation.
 //
-// Faithful port of penelope.c to Zig 0.15.2.
+// Faithful port of penelope.c v7 to Zig.
 //
-// Input:  text -> BPE subword tokens (2048-token byte-pair encoding)
-// Attend: RRPRAM resonance + SwiGLU per step (how it thinks)
-// Output: word-level from 1984 vocab (gibberish impossible)
+// 8-layer sequential transformer with multi-head attention, RoPE,
+// RRPRAM resonance gates, and SwiGLU FFN. Dual tokenizer:
+// BPE input (2048 subwords), word-level output (1984 words).
 //
-// 12 learned step-weights (~1.03M each). Each step has its own lens.
-// Step 1 sees the surface. Step 12 sees the bone.
+// Architecture per layer l:
+//     h = rmsnorm(x, attn_norm_l)
+//     qkv_out = MultiHeadAttention(h; wq_l, wk_l, wv_l, wo_l, RoPE)
+//     rrp = h @ wr_l                            RRPRAM resonance
+//     gate = softmax(gate_l[0], gate_l[1])
+//     x = x + gate[0]*qkv_out + gate[1]*rrp    gated residual
+//     h2 = rmsnorm(x, ffn_norm_l)
+//     x = x + SwiGLU(h2; w_gate_l, w_up_l, w_down_l)  residual
 //
-// Architecture per step s:
-//     context = pool(embed_in(BPE tokens))
-//     query   = RMSNorm(context @ Wr_s)          RRPRAM resonance
-//     hidden  = SwiGLU(query; gate_s, up_s, down_s)
-//     logits  = (query + hidden) @ E_out^T        separate output embed
-//     logits += DarioField(context)               live overlay
-//     word    = sample(softmax(logits))
+// After 8 layers:
+//     logits = rmsnorm(x, final_norm) @ lm_head^T
+//     word_score(w) = mean(logits[bpe_tokens(w)]) + DarioField
 //
-// Total: ~14M params (786K embed_in + 762K embed_out + 12 x 1.03M steps)
-//
-// By Arianna Method. הרזוננס לא נשבר
+// By Arianna Method
 
 const std = @import("std");
 
 const NWORDS: usize = 1984;
-const NSTEPS: usize = 12;
-const DIM: usize = 384;
-const HDIM: usize = 768;
+const DIM: usize = 448;
+const HDIM: usize = 896; // DIM * 2, SwiGLU hidden
+const N_HEADS: usize = 7;
+const HEAD_DIM: usize = 64; // DIM / N_HEADS
+const N_LAYERS: usize = 8; // sequential transformer layers
+const MAX_SEQ: usize = 256;
 const MAX_COOC: usize = 32768;
 const MAX_BIG: usize = 16384;
-const MAX_CTX: usize = 64;
 
 const BPE_VOCAB: usize = 2048;
 const BPE_MERGES: usize = 1792;
 const MAX_BPE_SEQ: usize = 8192;
+const MAX_EXT_VOCAB: usize = 4096;
+const GEN_STEPS: usize = 12; // number of words to generate per chain
 
 // ═══════════════════════════════════════════════════════════════
 // BPE MERGE TABLE — 1792 merges, learned from English text
@@ -2390,25 +2394,45 @@ fn siluf(x: f32) f32 {
     return 0.0;
 }
 
+
 // ═══════════════════════════════════════════════════════════════
-// TRAINABLE MODEL — 12 step-specific weight sets + split embeddings
+// TRAINABLE MODEL — v7 Resonance: 8 sequential layers with
+// multi-head attention + RoPE + RRPRAM resonance gate + SwiGLU
 // ═══════════════════════════════════════════════════════════════
 
-const StepWeights = struct {
-    wr: []f32, // [DIM * DIM]
-    rms: []f32, // [DIM]
-    w_gate: []f32, // [DIM * HDIM]
-    w_up: []f32, // [DIM * HDIM]
-    w_down: []f32, // [HDIM * DIM]
+const LayerWeights = struct {
+    attn_norm: []f32, // [DIM]         pre-attention RMSNorm
+    wq: []f32, // [DIM * DIM]   query projection
+    wk: []f32, // [DIM * DIM]   key projection
+    wv: []f32, // [DIM * DIM]   value projection
+    wo: []f32, // [DIM * DIM]   output projection
+    wr: []f32, // [DIM * DIM]   RRPRAM resonance
+    gate: [2]f32, // blend QKV + RRPRAM
+    ffn_norm: []f32, // [DIM]         pre-FFN RMSNorm
+    w_gate: []f32, // [DIM * HDIM]  SwiGLU gate (HDIM > DIM)
+    w_up: []f32, // [DIM * HDIM]  SwiGLU up
+    w_down: []f32, // [HDIM * DIM]  SwiGLU down
 };
 
-const StepAdam = struct {
+const LayerAdam = struct {
+    attn_norm_m: []f32,
+    attn_norm_v: []f32,
+    wq_m: []f32,
+    wq_v: []f32,
+    wk_m: []f32,
+    wk_v: []f32,
+    wv_m: []f32,
+    wv_v: []f32,
+    wo_m: []f32,
+    wo_v: []f32,
     wr_m: []f32,
     wr_v: []f32,
-    rms_m: []f32,
-    rms_v: []f32,
-    gate_m: []f32,
-    gate_v: []f32,
+    gate_m: [2]f32,
+    gate_v: [2]f32,
+    ffn_norm_m: []f32,
+    ffn_norm_v: []f32,
+    gate_w_m: []f32, // SwiGLU gate
+    gate_w_v: []f32,
     up_m: []f32,
     up_v: []f32,
     down_m: []f32,
@@ -2420,23 +2444,34 @@ const ADAM_B2: f32 = 0.999;
 const ADAM_EPS: f32 = 1e-8;
 
 const Model = struct {
-    embed_in: []f32, // [BPE_VOCAB * DIM]  input BPE embedding
-    embed_out: []f32, // [NWORDS * DIM]     output word embedding
-    embed_in_m: []f32,
-    embed_in_v: []f32, // Adam for input embed
-    embed_out_m: []f32,
-    embed_out_v: []f32, // Adam for output embed
-    steps: [NSTEPS]StepWeights,
-    adam: [NSTEPS]StepAdam,
+    // Global weights
+    tok_emb: []f32, // [BPE_VOCAB * DIM]  token embedding
+    pos_emb: []f32, // [MAX_SEQ * DIM]    positional embedding
+    final_norm: []f32, // [DIM]              final RMSNorm
+    lm_head: []f32, // [BPE_VOCAB * DIM]  language model head
+    // Adam for global weights
+    tok_emb_m: []f32,
+    tok_emb_v: []f32,
+    pos_emb_m: []f32,
+    pos_emb_v: []f32,
+    final_norm_m: []f32,
+    final_norm_v: []f32,
+    lm_head_m: []f32,
+    lm_head_v: []f32,
+    // Per-layer
+    layers: [N_LAYERS]LayerWeights,
+    adam: [N_LAYERS]LayerAdam,
     adam_t: i32,
 };
 
-fn stepParamCount() usize {
-    return DIM * DIM + DIM + DIM * HDIM + DIM * HDIM + HDIM * DIM;
+fn layerParamCount() usize {
+    // attn_norm + wq + wk + wv + wo + wr + gate + ffn_norm + w_gate + w_up + w_down
+    return DIM + DIM * DIM * 5 + 2 + DIM + DIM * HDIM * 2 + HDIM * DIM;
 }
 
 fn totalParamCount() usize {
-    return BPE_VOCAB * DIM + NWORDS * DIM + NSTEPS * stepParamCount();
+    const global = BPE_VOCAB * DIM + MAX_SEQ * DIM + DIM + BPE_VOCAB * DIM;
+    return global + N_LAYERS * layerParamCount();
 }
 
 fn allocZeroed(allocator: std.mem.Allocator, n: usize) ![]f32 {
@@ -2446,77 +2481,133 @@ fn allocZeroed(allocator: std.mem.Allocator, n: usize) ![]f32 {
 }
 
 fn modelInit(m: *Model, allocator: std.mem.Allocator) !void {
-    const ein_sz = BPE_VOCAB * DIM;
-    const eout_sz = NWORDS * DIM;
-    const scale_bpe: f32 = @sqrt(2.0 / @as(f32, @floatFromInt(BPE_VOCAB)));
-    const scale_v: f32 = @sqrt(2.0 / @as(f32, @floatFromInt(NWORDS)));
+    const te_sz = BPE_VOCAB * DIM;
+    const pe_sz = MAX_SEQ * DIM;
+    const lh_sz = BPE_VOCAB * DIM;
     const scale_d: f32 = @sqrt(2.0 / @as(f32, @floatFromInt(DIM)));
-    const scale_m: f32 = @sqrt(2.0 / @as(f32, @floatFromInt(HDIM)));
+    const scale_h: f32 = @sqrt(2.0 / @as(f32, @floatFromInt(HDIM)));
+    const scale_bpe: f32 = @sqrt(2.0 / @as(f32, @floatFromInt(BPE_VOCAB)));
 
-    m.embed_in = try allocator.alloc(f32, ein_sz);
-    m.embed_in_m = try allocZeroed(allocator, ein_sz);
-    m.embed_in_v = try allocZeroed(allocator, ein_sz);
-    m.embed_out = try allocator.alloc(f32, eout_sz);
-    m.embed_out_m = try allocZeroed(allocator, eout_sz);
-    m.embed_out_v = try allocZeroed(allocator, eout_sz);
+    // Global weights
+    m.tok_emb = try allocator.alloc(f32, te_sz);
+    m.pos_emb = try allocator.alloc(f32, pe_sz);
+    m.final_norm = try allocator.alloc(f32, DIM);
+    m.lm_head = try allocator.alloc(f32, lh_sz);
+    // Adam for globals
+    m.tok_emb_m = try allocZeroed(allocator, te_sz);
+    m.tok_emb_v = try allocZeroed(allocator, te_sz);
+    m.pos_emb_m = try allocZeroed(allocator, pe_sz);
+    m.pos_emb_v = try allocZeroed(allocator, pe_sz);
+    m.final_norm_m = try allocZeroed(allocator, DIM);
+    m.final_norm_v = try allocZeroed(allocator, DIM);
+    m.lm_head_m = try allocZeroed(allocator, lh_sz);
+    m.lm_head_v = try allocZeroed(allocator, lh_sz);
     m.adam_t = 0;
 
-    for (0..ein_sz) |i| {
-        m.embed_in[i] = randn() * scale_bpe;
-    }
-    for (0..eout_sz) |i| {
-        m.embed_out[i] = randn() * scale_v;
-    }
+    for (0..te_sz) |i| m.tok_emb[i] = randn() * scale_bpe;
+    for (0..pe_sz) |i| m.pos_emb[i] = randn() * 0.02;
+    for (0..DIM) |i| m.final_norm[i] = 1.0;
+    for (0..lh_sz) |i| m.lm_head[i] = randn() * scale_d;
 
-    for (0..NSTEPS) |s| {
-        m.steps[s].wr = try allocator.alloc(f32, DIM * DIM);
-        m.steps[s].rms = try allocator.alloc(f32, DIM);
-        m.steps[s].w_gate = try allocator.alloc(f32, DIM * HDIM);
-        m.steps[s].w_up = try allocator.alloc(f32, DIM * HDIM);
-        m.steps[s].w_down = try allocator.alloc(f32, HDIM * DIM);
+    for (0..N_LAYERS) |l| {
+        var lw = &m.layers[l];
+        var la = &m.adam[l];
 
-        m.adam[s].wr_m = try allocZeroed(allocator, DIM * DIM);
-        m.adam[s].wr_v = try allocZeroed(allocator, DIM * DIM);
-        m.adam[s].rms_m = try allocZeroed(allocator, DIM);
-        m.adam[s].rms_v = try allocZeroed(allocator, DIM);
-        m.adam[s].gate_m = try allocZeroed(allocator, DIM * HDIM);
-        m.adam[s].gate_v = try allocZeroed(allocator, DIM * HDIM);
-        m.adam[s].up_m = try allocZeroed(allocator, DIM * HDIM);
-        m.adam[s].up_v = try allocZeroed(allocator, DIM * HDIM);
-        m.adam[s].down_m = try allocZeroed(allocator, HDIM * DIM);
-        m.adam[s].down_v = try allocZeroed(allocator, HDIM * DIM);
+        lw.attn_norm = try allocator.alloc(f32, DIM);
+        lw.wq = try allocator.alloc(f32, DIM * DIM);
+        lw.wk = try allocator.alloc(f32, DIM * DIM);
+        lw.wv = try allocator.alloc(f32, DIM * DIM);
+        lw.wo = try allocator.alloc(f32, DIM * DIM);
+        lw.wr = try allocator.alloc(f32, DIM * DIM);
+        lw.gate = .{ 0.0, 0.0 }; // 50/50 blend
+        lw.ffn_norm = try allocator.alloc(f32, DIM);
+        lw.w_gate = try allocator.alloc(f32, DIM * HDIM);
+        lw.w_up = try allocator.alloc(f32, DIM * HDIM);
+        lw.w_down = try allocator.alloc(f32, HDIM * DIM);
 
-        for (0..DIM * DIM) |i| m.steps[s].wr[i] = randn() * scale_d;
-        for (0..DIM) |i| m.steps[s].rms[i] = 1.0;
-        for (0..DIM * HDIM) |i| m.steps[s].w_gate[i] = randn() * scale_d;
-        for (0..DIM * HDIM) |i| m.steps[s].w_up[i] = randn() * scale_d;
-        for (0..HDIM * DIM) |i| m.steps[s].w_down[i] = randn() * scale_m;
+        // Adam moment buffers
+        la.attn_norm_m = try allocZeroed(allocator, DIM);
+        la.attn_norm_v = try allocZeroed(allocator, DIM);
+        la.wq_m = try allocZeroed(allocator, DIM * DIM);
+        la.wq_v = try allocZeroed(allocator, DIM * DIM);
+        la.wk_m = try allocZeroed(allocator, DIM * DIM);
+        la.wk_v = try allocZeroed(allocator, DIM * DIM);
+        la.wv_m = try allocZeroed(allocator, DIM * DIM);
+        la.wv_v = try allocZeroed(allocator, DIM * DIM);
+        la.wo_m = try allocZeroed(allocator, DIM * DIM);
+        la.wo_v = try allocZeroed(allocator, DIM * DIM);
+        la.wr_m = try allocZeroed(allocator, DIM * DIM);
+        la.wr_v = try allocZeroed(allocator, DIM * DIM);
+        la.gate_m = .{ 0.0, 0.0 };
+        la.gate_v = .{ 0.0, 0.0 };
+        la.ffn_norm_m = try allocZeroed(allocator, DIM);
+        la.ffn_norm_v = try allocZeroed(allocator, DIM);
+        la.gate_w_m = try allocZeroed(allocator, DIM * HDIM);
+        la.gate_w_v = try allocZeroed(allocator, DIM * HDIM);
+        la.up_m = try allocZeroed(allocator, DIM * HDIM);
+        la.up_v = try allocZeroed(allocator, DIM * HDIM);
+        la.down_m = try allocZeroed(allocator, HDIM * DIM);
+        la.down_v = try allocZeroed(allocator, HDIM * DIM);
+
+        for (0..DIM) |i| lw.attn_norm[i] = 1.0;
+        for (0..DIM * DIM) |i| lw.wq[i] = randn() * scale_d;
+        for (0..DIM * DIM) |i| lw.wk[i] = randn() * scale_d;
+        for (0..DIM * DIM) |i| lw.wv[i] = randn() * scale_d;
+        for (0..DIM * DIM) |i| lw.wo[i] = randn() * scale_d;
+        for (0..DIM * DIM) |i| lw.wr[i] = randn() * scale_d;
+        for (0..DIM) |i| lw.ffn_norm[i] = 1.0;
+        for (0..DIM * HDIM) |i| lw.w_gate[i] = randn() * scale_d;
+        for (0..DIM * HDIM) |i| lw.w_up[i] = randn() * scale_d;
+        for (0..HDIM * DIM) |i| lw.w_down[i] = randn() * scale_h;
     }
 }
 
 fn modelFree(m: *Model, allocator: std.mem.Allocator) void {
-    allocator.free(m.embed_in);
-    allocator.free(m.embed_in_m);
-    allocator.free(m.embed_in_v);
-    allocator.free(m.embed_out);
-    allocator.free(m.embed_out_m);
-    allocator.free(m.embed_out_v);
-    for (0..NSTEPS) |s| {
-        allocator.free(m.steps[s].wr);
-        allocator.free(m.steps[s].rms);
-        allocator.free(m.steps[s].w_gate);
-        allocator.free(m.steps[s].w_up);
-        allocator.free(m.steps[s].w_down);
-        allocator.free(m.adam[s].wr_m);
-        allocator.free(m.adam[s].wr_v);
-        allocator.free(m.adam[s].rms_m);
-        allocator.free(m.adam[s].rms_v);
-        allocator.free(m.adam[s].gate_m);
-        allocator.free(m.adam[s].gate_v);
-        allocator.free(m.adam[s].up_m);
-        allocator.free(m.adam[s].up_v);
-        allocator.free(m.adam[s].down_m);
-        allocator.free(m.adam[s].down_v);
+    allocator.free(m.tok_emb);
+    allocator.free(m.tok_emb_m);
+    allocator.free(m.tok_emb_v);
+    allocator.free(m.pos_emb);
+    allocator.free(m.pos_emb_m);
+    allocator.free(m.pos_emb_v);
+    allocator.free(m.final_norm);
+    allocator.free(m.final_norm_m);
+    allocator.free(m.final_norm_v);
+    allocator.free(m.lm_head);
+    allocator.free(m.lm_head_m);
+    allocator.free(m.lm_head_v);
+    for (0..N_LAYERS) |l| {
+        const lw = &m.layers[l];
+        allocator.free(lw.attn_norm);
+        allocator.free(lw.wq);
+        allocator.free(lw.wk);
+        allocator.free(lw.wv);
+        allocator.free(lw.wo);
+        allocator.free(lw.wr);
+        allocator.free(lw.ffn_norm);
+        allocator.free(lw.w_gate);
+        allocator.free(lw.w_up);
+        allocator.free(lw.w_down);
+        const la = &m.adam[l];
+        allocator.free(la.attn_norm_m);
+        allocator.free(la.attn_norm_v);
+        allocator.free(la.wq_m);
+        allocator.free(la.wq_v);
+        allocator.free(la.wk_m);
+        allocator.free(la.wk_v);
+        allocator.free(la.wv_m);
+        allocator.free(la.wv_v);
+        allocator.free(la.wo_m);
+        allocator.free(la.wo_v);
+        allocator.free(la.wr_m);
+        allocator.free(la.wr_v);
+        allocator.free(la.ffn_norm_m);
+        allocator.free(la.ffn_norm_v);
+        allocator.free(la.gate_w_m);
+        allocator.free(la.gate_w_v);
+        allocator.free(la.up_m);
+        allocator.free(la.up_v);
+        allocator.free(la.down_m);
+        allocator.free(la.down_v);
     }
 }
 
@@ -2536,39 +2627,61 @@ fn adamUpdate(w: []f32, am: []f32, av: []f32, grad: []f32, lr: f32, bc1: f32, bc
     }
 }
 
+// ═══════════════════════════════════════════════════════════════
+// SAVE/LOAD — PEN7 binary format
+// ═══════════════════════════════════════════════════════════════
+
 fn modelSave(m: *Model, path: []const u8) !void {
-    const stderr = (std.fs.File{ .handle = std.posix.STDERR_FILENO }).deprecatedWriter();
+    const stderr_w = (std.fs.File{ .handle = std.posix.STDERR_FILENO }).deprecatedWriter();
     const stdout_w = (std.fs.File{ .handle = std.posix.STDOUT_FILENO }).deprecatedWriter();
 
     const file = std.fs.cwd().createFile(path, .{}) catch {
-        try stderr.print("  cannot open {s} for writing\n", .{path});
+        try stderr_w.print("  cannot open {s} for writing\n", .{path});
         return;
     };
     defer file.close();
     const writer = file.deprecatedWriter();
 
-    // Write v2 header
-    const header = [6]i32{ 0x50454E32, @intCast(BPE_VOCAB), @intCast(NWORDS), @intCast(DIM), @intCast(HDIM), @intCast(NSTEPS) };
+    // PEN7 header: magic, BPE_VOCAB, NWORDS, DIM, HDIM, N_HEADS, N_LAYERS, MAX_SEQ
+    const header = [8]i32{
+        0x50454E37,
+        @intCast(BPE_VOCAB),
+        @intCast(NWORDS),
+        @intCast(DIM),
+        @intCast(HDIM),
+        @intCast(N_HEADS),
+        @intCast(N_LAYERS),
+        @intCast(MAX_SEQ),
+    };
     try writer.writeAll(std.mem.sliceAsBytes(&header));
 
-    // Write embed_in and embed_out
-    try writer.writeAll(std.mem.sliceAsBytes(m.embed_in));
-    try writer.writeAll(std.mem.sliceAsBytes(m.embed_out));
+    // Global weights
+    try writer.writeAll(std.mem.sliceAsBytes(m.tok_emb));
+    try writer.writeAll(std.mem.sliceAsBytes(m.pos_emb));
+    try writer.writeAll(std.mem.sliceAsBytes(m.final_norm));
+    try writer.writeAll(std.mem.sliceAsBytes(m.lm_head));
 
-    // Write step weights
-    for (0..NSTEPS) |s| {
-        try writer.writeAll(std.mem.sliceAsBytes(m.steps[s].wr));
-        try writer.writeAll(std.mem.sliceAsBytes(m.steps[s].rms));
-        try writer.writeAll(std.mem.sliceAsBytes(m.steps[s].w_gate));
-        try writer.writeAll(std.mem.sliceAsBytes(m.steps[s].w_up));
-        try writer.writeAll(std.mem.sliceAsBytes(m.steps[s].w_down));
+    // Per-layer weights
+    for (0..N_LAYERS) |l| {
+        const lw = &m.layers[l];
+        try writer.writeAll(std.mem.sliceAsBytes(lw.attn_norm));
+        try writer.writeAll(std.mem.sliceAsBytes(lw.wq));
+        try writer.writeAll(std.mem.sliceAsBytes(lw.wk));
+        try writer.writeAll(std.mem.sliceAsBytes(lw.wv));
+        try writer.writeAll(std.mem.sliceAsBytes(lw.wo));
+        try writer.writeAll(std.mem.sliceAsBytes(lw.wr));
+        try writer.writeAll(std.mem.sliceAsBytes(&lw.gate));
+        try writer.writeAll(std.mem.sliceAsBytes(lw.ffn_norm));
+        try writer.writeAll(std.mem.sliceAsBytes(lw.w_gate));
+        try writer.writeAll(std.mem.sliceAsBytes(lw.w_up));
+        try writer.writeAll(std.mem.sliceAsBytes(lw.w_down));
     }
 
     // Verify
     const check = try std.fs.cwd().openFile(path, .{});
     defer check.close();
     const sz = try check.getEndPos();
-    const expected: u64 = 24 + @as(u64, totalParamCount()) * 4;
+    const expected: u64 = 32 + @as(u64, totalParamCount()) * 4;
     const ok_str = if (sz == expected) "OK" else "SIZE MISMATCH!";
     try stdout_w.print("  saved {s}: {d} params ({d:.1}MB) [{s}]\n", .{
         path,
@@ -2579,97 +2692,69 @@ fn modelSave(m: *Model, path: []const u8) !void {
 }
 
 fn modelLoad(m: *Model, path: []const u8) !bool {
-    const stderr = (std.fs.File{ .handle = std.posix.STDERR_FILENO }).deprecatedWriter();
+    const stderr_w = (std.fs.File{ .handle = std.posix.STDERR_FILENO }).deprecatedWriter();
     const stdout_w = (std.fs.File{ .handle = std.posix.STDOUT_FILENO }).deprecatedWriter();
 
     const file = std.fs.cwd().openFile(path, .{}) catch {
-        try stderr.print("  cannot open {s}\n", .{path});
+        try stderr_w.print("  cannot open {s}\n", .{path});
         return false;
     };
     defer file.close();
     const reader = file.deprecatedReader();
 
-    // Read first int to detect format
-    var magic: [1]i32 = undefined;
-    const magic_bytes = std.mem.sliceAsBytes(&magic);
-    const n_read = try reader.readAll(magic_bytes);
-    if (n_read != magic_bytes.len) {
-        try stderr.print("  cannot read header from {s}\n", .{path});
+    // Read header
+    var header: [8]i32 = undefined;
+    _ = try reader.readAll(std.mem.sliceAsBytes(&header));
+
+    if (header[0] != 0x50454E37) {
+        try stderr_w.print("  unknown format magic=0x{X:0>8} (expected PEN7=0x50454E37)\n", .{@as(u32, @bitCast(header[0]))});
         return false;
     }
-
-    if (magic[0] == 0x50454E32) {
-        // v2 format
-        var hdr: [5]i32 = undefined;
-        _ = try reader.readAll(std.mem.sliceAsBytes(&hdr));
-        if (hdr[0] != @as(i32, BPE_VOCAB) or hdr[1] != @as(i32, NWORDS) or
-            hdr[2] != @as(i32, DIM) or hdr[3] != @as(i32, HDIM) or hdr[4] != @as(i32, NSTEPS))
-        {
-            try stderr.print("  v2 config mismatch: BV={d} V={d} D={d} M={d} S={d}\n", .{
-                hdr[0], hdr[1], hdr[2], hdr[3], hdr[4],
-            });
-            return false;
-        }
-        _ = try reader.readAll(std.mem.sliceAsBytes(m.embed_in));
-        _ = try reader.readAll(std.mem.sliceAsBytes(m.embed_out));
-        for (0..NSTEPS) |s| {
-            _ = try reader.readAll(std.mem.sliceAsBytes(m.steps[s].wr));
-            _ = try reader.readAll(std.mem.sliceAsBytes(m.steps[s].rms));
-            _ = try reader.readAll(std.mem.sliceAsBytes(m.steps[s].w_gate));
-            _ = try reader.readAll(std.mem.sliceAsBytes(m.steps[s].w_up));
-            _ = try reader.readAll(std.mem.sliceAsBytes(m.steps[s].w_down));
-        }
-        try stdout_w.print("  loaded v2 {s}: {d} params\n", .{ path, totalParamCount() });
-        return true;
-    }
-
-    // v1 format: magic was actually header[0]=NWORDS
-    var v1_hdr: [3]i32 = undefined;
-    _ = try reader.readAll(std.mem.sliceAsBytes(&v1_hdr));
-    if (magic[0] != @as(i32, NWORDS) or v1_hdr[0] != @as(i32, DIM) or
-        v1_hdr[1] != @as(i32, HDIM) or v1_hdr[2] != @as(i32, NSTEPS))
+    if (header[1] != @as(i32, BPE_VOCAB) or header[2] != @as(i32, NWORDS) or
+        header[3] != @as(i32, DIM) or header[4] != @as(i32, HDIM) or
+        header[5] != @as(i32, N_HEADS) or header[6] != @as(i32, N_LAYERS) or
+        header[7] != @as(i32, MAX_SEQ))
     {
-        try stderr.print("  v1 config mismatch: V={d} D={d} M={d} S={d}\n", .{
-            magic[0], v1_hdr[0], v1_hdr[1], v1_hdr[2],
+        try stderr_w.print("  v7 config mismatch: BV={d} V={d} D={d} H={d} NH={d} NL={d} S={d}\n", .{
+            header[1], header[2], header[3], header[4], header[5], header[6], header[7],
         });
         return false;
     }
-    // read old embed -> embed_out, init embed_in randomly
-    _ = try reader.readAll(std.mem.sliceAsBytes(m.embed_out));
-    const scale_bpe: f32 = @sqrt(2.0 / @as(f32, @floatFromInt(BPE_VOCAB)));
-    for (0..BPE_VOCAB * DIM) |i| {
-        m.embed_in[i] = randn() * scale_bpe;
+
+    // Global weights
+    _ = try reader.readAll(std.mem.sliceAsBytes(m.tok_emb));
+    _ = try reader.readAll(std.mem.sliceAsBytes(m.pos_emb));
+    _ = try reader.readAll(std.mem.sliceAsBytes(m.final_norm));
+    _ = try reader.readAll(std.mem.sliceAsBytes(m.lm_head));
+
+    // Per-layer
+    for (0..N_LAYERS) |l| {
+        var lw = &m.layers[l];
+        _ = try reader.readAll(std.mem.sliceAsBytes(lw.attn_norm));
+        _ = try reader.readAll(std.mem.sliceAsBytes(lw.wq));
+        _ = try reader.readAll(std.mem.sliceAsBytes(lw.wk));
+        _ = try reader.readAll(std.mem.sliceAsBytes(lw.wv));
+        _ = try reader.readAll(std.mem.sliceAsBytes(lw.wo));
+        _ = try reader.readAll(std.mem.sliceAsBytes(lw.wr));
+        _ = try reader.readAll(std.mem.sliceAsBytes(&lw.gate));
+        _ = try reader.readAll(std.mem.sliceAsBytes(lw.ffn_norm));
+        _ = try reader.readAll(std.mem.sliceAsBytes(lw.w_gate));
+        _ = try reader.readAll(std.mem.sliceAsBytes(lw.w_up));
+        _ = try reader.readAll(std.mem.sliceAsBytes(lw.w_down));
     }
-    for (0..NSTEPS) |s| {
-        _ = try reader.readAll(std.mem.sliceAsBytes(m.steps[s].wr));
-        _ = try reader.readAll(std.mem.sliceAsBytes(m.steps[s].rms));
-        _ = try reader.readAll(std.mem.sliceAsBytes(m.steps[s].w_gate));
-        _ = try reader.readAll(std.mem.sliceAsBytes(m.steps[s].w_up));
-        _ = try reader.readAll(std.mem.sliceAsBytes(m.steps[s].w_down));
-    }
-    try stdout_w.print("  WARNING: migrated v1 weights -> v2 (embed_in initialized randomly)\n", .{});
-    try stdout_w.print("  loaded v1 {s}: {d} params (embed_out from v1, embed_in new)\n", .{ path, totalParamCount() });
+
+    try stdout_w.print("  loaded v7 {s}: {d} params ({d:.1}MB)\n", .{
+        path,
+        totalParamCount(),
+        @as(f64, @floatFromInt(totalParamCount())) * 4.0 / 1e6,
+    });
     return true;
 }
 
 // ═══════════════════════════════════════════════════════════════
-// FORWARD — one step produces logits[NWORDS]
+// FORWARD — v7 Resonance: 8 sequential layers, multi-head
+// attention + RoPE + RRPRAM gate + SwiGLU, then BPE logits
 // ═══════════════════════════════════════════════════════════════
-
-fn poolContext(m: *Model, bpe_ids: []const i32, ctx: []f32) void {
-    const n = bpe_ids.len;
-    @memset(ctx[0..DIM], 0);
-    for (0..n) |i| {
-        const id: usize = @intCast(bpe_ids[i]);
-        for (0..DIM) |j| {
-            ctx[j] += m.embed_in[id * DIM + j];
-        }
-    }
-    const inv: f32 = 1.0 / @as(f32, @floatFromInt(if (n > 0) n else 1));
-    for (0..DIM) |j| {
-        ctx[j] *= inv;
-    }
-}
 
 fn matmulMv(W: []const f32, x: []const f32, out: []f32, rows: usize, cols: usize) void {
     for (0..rows) |i| {
@@ -2681,16 +2766,6 @@ fn matmulMv(W: []const f32, x: []const f32, out: []f32, rows: usize, cols: usize
     }
 }
 
-fn matmulMtv(W: []const f32, x: []const f32, out: []f32, rows: usize, cols: usize) void {
-    for (0..cols) |j| {
-        var s: f32 = 0;
-        for (0..rows) |i| {
-            s += W[i * cols + j] * x[i];
-        }
-        out[j] = s;
-    }
-}
-
 fn rmsnorm(x: []const f32, g: []const f32, out: []f32, n: usize) void {
     var ss: f32 = 0;
     for (0..n) |i| ss += x[i] * x[i];
@@ -2699,87 +2774,344 @@ fn rmsnorm(x: []const f32, g: []const f32, out: []f32, n: usize) void {
     for (0..n) |i| out[i] = g[i] * x[i] * inv;
 }
 
-fn forwardStep(
-    m: *Model,
-    ctx_ids: []const i32,
-    step_idx: usize,
-    logits: []f32,
-    query: []f32,
-    query_n: []f32,
-    gate_buf: []f32,
-    up_buf: []f32,
-    swiglu_buf: []f32,
-    hidden: []f32,
-    out: []f32,
-) void {
-    const sw = &m.steps[step_idx];
-    var ctx: [DIM]f32 = undefined;
-    poolContext(m, ctx_ids, &ctx);
-
-    // RRPRAM: query = ctx @ Wr
-    matmulMv(sw.wr, &ctx, query, DIM, DIM);
-    // RMSNorm
-    rmsnorm(query, sw.rms, query_n, DIM);
-    // SwiGLU
-    matmulMv(sw.w_gate, query_n, gate_buf, HDIM, DIM);
-    matmulMv(sw.w_up, query_n, up_buf, HDIM, DIM);
-    for (0..HDIM) |i| {
-        swiglu_buf[i] = siluf(gate_buf[i]) * up_buf[i];
+/// RoPE: apply rotary position embedding to q and k
+/// q, k: [seq_len * n_heads * head_dim] laid out as [t][h][d]
+fn applyRope(q: []f32, k: []f32, seq_len: usize) void {
+    const theta_base: f32 = 10000.0;
+    for (0..seq_len) |t| {
+        for (0..N_HEADS) |h| {
+            const qh_off = (t * N_HEADS + h) * HEAD_DIM;
+            const kh_off = (t * N_HEADS + h) * HEAD_DIM;
+            for (0..HEAD_DIM / 2) |d| {
+                const freq = 1.0 / std.math.pow(f32, theta_base, 2.0 * @as(f32, @floatFromInt(d)) / @as(f32, @floatFromInt(HEAD_DIM)));
+                const cos_f = @cos(@as(f32, @floatFromInt(t)) * freq);
+                const sin_f = @sin(@as(f32, @floatFromInt(t)) * freq);
+                // rotate q
+                const q0 = q[qh_off + d];
+                const q1 = q[qh_off + d + HEAD_DIM / 2];
+                q[qh_off + d] = q0 * cos_f - q1 * sin_f;
+                q[qh_off + d + HEAD_DIM / 2] = q0 * sin_f + q1 * cos_f;
+                // rotate k
+                const k0 = k[kh_off + d];
+                const k1 = k[kh_off + d + HEAD_DIM / 2];
+                k[kh_off + d] = k0 * cos_f - k1 * sin_f;
+                k[kh_off + d + HEAD_DIM / 2] = k0 * sin_f + k1 * cos_f;
+            }
+        }
     }
-    matmulMv(sw.w_down, swiglu_buf, hidden, DIM, HDIM);
-    // Residual
-    for (0..DIM) |i| {
-        out[i] = query_n[i] + hidden[i];
-    }
-    // Logits = E_out @ out (separate output embed)
-    matmulMv(m.embed_out, out, logits, NWORDS, DIM);
 }
 
-fn forwardStepTrained(
-    m: *Model,
-    ctx_ids: []const i32,
-    step_idx: usize,
-    logits: []f32,
-    query: []f32,
-    query_n: []f32,
-    gate_buf: []f32,
-    up_buf: []f32,
-    swiglu_buf: []f32,
-    hidden: []f32,
-    out: []f32,
-) void {
-    const sw = &m.steps[step_idx];
-    var ctx: [DIM]f32 = undefined;
-    poolContext(m, ctx_ids, &ctx);
+/// Full forward pass through all 8 layers for a sequence of BPE tokens.
+/// Input:  bpe_ids[seq_len]
+/// Output: logits[BPE_VOCAB] for the LAST token position only
+fn forward(m: *Model, bpe_ids: []const i32, seq_len_in: usize, logits: []f32, allocator: std.mem.Allocator) !void {
+    var S = seq_len_in;
+    if (S < 1) S = 1;
+    if (S > MAX_SEQ) S = MAX_SEQ;
 
-    // RRPRAM: query = ctx @ Wr
-    matmulMv(sw.wr, &ctx, query, DIM, DIM);
-    // RMSNorm
-    rmsnorm(query, sw.rms, query_n, DIM);
-    // SwiGLU
-    matmulMv(sw.w_gate, query_n, gate_buf, HDIM, DIM);
-    matmulMv(sw.w_up, query_n, up_buf, HDIM, DIM);
-    for (0..HDIM) |i| {
-        swiglu_buf[i] = siluf(gate_buf[i]) * up_buf[i];
-    }
-    matmulMv(sw.w_down, swiglu_buf, hidden, DIM, HDIM);
-    // Residual
-    for (0..DIM) |i| {
-        out[i] = query_n[i] + hidden[i];
-    }
-    // Word-level logits from BPE input embeddings
-    for (0..NWORDS) |w| {
-        var score: f32 = 0;
-        const bl = vocab_bpe_len[w];
-        for (0..bl) |b| {
-            const tok: usize = @intCast(vocab_bpe[w][b]);
-            var dot: f32 = 0;
-            for (0..DIM) |j| {
-                dot += m.embed_in[tok * DIM + j] * out[j];
-            }
-            score += dot;
+    // x: [S * DIM] -- residual stream
+    const x = try allocator.alloc(f32, S * DIM);
+    defer allocator.free(x);
+    @memset(x, 0);
+
+    // embed: tok_emb + pos_emb
+    for (0..S) |t| {
+        var tok: usize = @intCast(bpe_ids[t]);
+        if (tok >= BPE_VOCAB) tok = 0;
+        for (0..DIM) |d| {
+            x[t * DIM + d] = m.tok_emb[tok * DIM + d] + m.pos_emb[t * DIM + d];
         }
-        logits[w] = if (bl > 0) score / @as(f32, @floatFromInt(bl)) else 0;
+    }
+
+    // scratch for attention
+    const h = try allocator.alloc(f32, S * DIM);
+    defer allocator.free(h);
+    const q = try allocator.alloc(f32, S * DIM);
+    defer allocator.free(q);
+    const k = try allocator.alloc(f32, S * DIM);
+    defer allocator.free(k);
+    const v = try allocator.alloc(f32, S * DIM);
+    defer allocator.free(v);
+    const att = try allocator.alloc(f32, S * S * N_HEADS);
+    defer allocator.free(att);
+    const av = try allocator.alloc(f32, S * DIM);
+    defer allocator.free(av);
+    const qkv_out = try allocator.alloc(f32, S * DIM);
+    defer allocator.free(qkv_out);
+    const rrp = try allocator.alloc(f32, S * DIM);
+    defer allocator.free(rrp);
+    const h2 = try allocator.alloc(f32, S * DIM);
+    defer allocator.free(h2);
+    const fg = try allocator.alloc(f32, S * HDIM);
+    defer allocator.free(fg);
+    const fu = try allocator.alloc(f32, S * HDIM);
+    defer allocator.free(fu);
+    const sw = try allocator.alloc(f32, S * HDIM);
+    defer allocator.free(sw);
+    const fd = try allocator.alloc(f32, S * DIM);
+    defer allocator.free(fd);
+
+    for (0..N_LAYERS) |l| {
+        const lw = &m.layers[l];
+
+        // 1. h = rmsnorm(x, attn_norm) for each position
+        for (0..S) |t| {
+            rmsnorm(x[t * DIM ..][0..DIM], lw.attn_norm, h[t * DIM ..][0..DIM], DIM);
+        }
+
+        // 2-3. q = h @ wq, k = h @ wk, v = h @ wv (per position)
+        for (0..S) |t| {
+            matmulMv(lw.wq, h[t * DIM ..][0..DIM], q[t * DIM ..][0..DIM], DIM, DIM);
+            matmulMv(lw.wk, h[t * DIM ..][0..DIM], k[t * DIM ..][0..DIM], DIM, DIM);
+            matmulMv(lw.wv, h[t * DIM ..][0..DIM], v[t * DIM ..][0..DIM], DIM, DIM);
+        }
+
+        // Apply RoPE to q and k
+        applyRope(q, k, S);
+
+        // 5. Multi-head causal attention: softmax(q @ k^T / sqrt(head_dim))
+        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(HEAD_DIM)));
+        for (0..N_HEADS) |hd| {
+            for (0..S) |ti| {
+                const qi_off = (ti * N_HEADS + hd) * HEAD_DIM;
+                // compute scores for all keys up to ti (causal)
+                var maxs: f32 = -1e30;
+                for (0..ti + 1) |tj| {
+                    const kj_off = (tj * N_HEADS + hd) * HEAD_DIM;
+                    var dot: f32 = 0;
+                    for (0..HEAD_DIM) |d| {
+                        dot += q[qi_off + d] * k[kj_off + d];
+                    }
+                    dot *= scale;
+                    att[(hd * S + ti) * S + tj] = dot;
+                    if (dot > maxs) maxs = dot;
+                }
+                // causal mask + softmax
+                var sum: f32 = 0;
+                for (0..ti + 1) |tj| {
+                    const val = @exp(att[(hd * S + ti) * S + tj] - maxs);
+                    att[(hd * S + ti) * S + tj] = val;
+                    sum += val;
+                }
+                const inv_s: f32 = if (sum > 0) 1.0 / sum else 0.0;
+                for (0..ti + 1) |tj| {
+                    att[(hd * S + ti) * S + tj] *= inv_s;
+                }
+                // zero out future positions
+                if (ti + 1 < S) {
+                    for (ti + 1..S) |tj| {
+                        att[(hd * S + ti) * S + tj] = 0;
+                    }
+                }
+            }
+        }
+
+        // 6. attn @ v, reshape, then @ wo
+        @memset(av, 0);
+        for (0..N_HEADS) |hd| {
+            for (0..S) |ti| {
+                const avi_off = (ti * N_HEADS + hd) * HEAD_DIM;
+                for (0..ti + 1) |tj| {
+                    const a = att[(hd * S + ti) * S + tj];
+                    if (a == 0) continue;
+                    const vj_off = (tj * N_HEADS + hd) * HEAD_DIM;
+                    for (0..HEAD_DIM) |d| {
+                        av[avi_off + d] += a * v[vj_off + d];
+                    }
+                }
+            }
+        }
+        // av is [S, DIM] (concatenated heads). Project through wo
+        for (0..S) |t| {
+            matmulMv(lw.wo, av[t * DIM ..][0..DIM], qkv_out[t * DIM ..][0..DIM], DIM, DIM);
+        }
+
+        // 7. RRPRAM resonance: rrp = h @ wr
+        for (0..S) |t| {
+            matmulMv(lw.wr, h[t * DIM ..][0..DIM], rrp[t * DIM ..][0..DIM], DIM, DIM);
+        }
+
+        // 8. gate_weights = softmax(gate[0], gate[1])
+        const g0 = lw.gate[0];
+        const g1 = lw.gate[1];
+        const gmax = if (g0 > g1) g0 else g1;
+        const e0 = @exp(g0 - gmax);
+        const e1 = @exp(g1 - gmax);
+        const gsum = e0 + e1;
+        const w0 = e0 / gsum;
+        const w1 = e1 / gsum;
+
+        // 9. x = x + w0 * qkv_out + w1 * rrp (residual)
+        for (0..S * DIM) |i| {
+            x[i] += w0 * qkv_out[i] + w1 * rrp[i];
+        }
+
+        // 10. h2 = rmsnorm(x, ffn_norm)
+        for (0..S) |t| {
+            rmsnorm(x[t * DIM ..][0..DIM], lw.ffn_norm, h2[t * DIM ..][0..DIM], DIM);
+        }
+
+        // 11. SwiGLU FFN: x = x + w_down @ (silu(h2 @ w_gate) * (h2 @ w_up))
+        for (0..S) |t| {
+            matmulMv(lw.w_gate, h2[t * DIM ..][0..DIM], fg[t * HDIM ..][0..HDIM], HDIM, DIM);
+            matmulMv(lw.w_up, h2[t * DIM ..][0..DIM], fu[t * HDIM ..][0..HDIM], HDIM, DIM);
+            for (0..HDIM) |i| {
+                sw[t * HDIM + i] = siluf(fg[t * HDIM + i]) * fu[t * HDIM + i];
+            }
+            matmulMv(lw.w_down, sw[t * HDIM ..][0..HDIM], fd[t * DIM ..][0..DIM], DIM, HDIM);
+            for (0..DIM) |d| {
+                x[t * DIM + d] += fd[t * DIM + d];
+            }
+        }
+    }
+
+    // After all layers: final rmsnorm + lm_head for LAST position
+    var xn: [DIM]f32 = undefined;
+    rmsnorm(x[(S - 1) * DIM ..][0..DIM], m.final_norm, &xn, DIM);
+    // logits = lm_head @ xn: lm_head[BPE_VOCAB, DIM] @ xn[DIM] -> logits[BPE_VOCAB]
+    matmulMv(m.lm_head, &xn, logits, BPE_VOCAB, DIM);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// EXTENDED VOCAB — hardcoded 1984 + BPE tokens that are whole words
+// ═══════════════════════════════════════════════════════════════
+
+const ExtWord = struct {
+    word: [64]u8,
+    word_len: usize,
+    bpe_ids: [16]i32,
+    bpe_len: usize,
+    from_hardcoded: bool,
+};
+
+var ext_vocab: [MAX_EXT_VOCAB]ExtWord = undefined;
+var ext_vocab_n: usize = 0;
+
+// BPE decode strings (built at init)
+var bpe_strs: [BPE_VOCAB][64]u8 = undefined;
+var bpe_str_len: [BPE_VOCAB]usize = undefined;
+
+fn initBpeDecode() void {
+    // First 256: single bytes
+    for (0..256) |i| {
+        bpe_strs[i][0] = @intCast(i);
+        bpe_strs[i][1] = 0;
+        bpe_str_len[i] = 1;
+    }
+    // Merged tokens
+    for (0..BPE_MERGES) |mi| {
+        const id = 256 + mi;
+        const left: usize = BPE_TABLE[mi][0];
+        const right: usize = BPE_TABLE[mi][1];
+        if (left < BPE_VOCAB and right < BPE_VOCAB) {
+            const ll = bpe_str_len[left];
+            const rl = bpe_str_len[right];
+            if (ll + rl < 64) {
+                @memcpy(bpe_strs[id][0..ll], bpe_strs[left][0..ll]);
+                @memcpy(bpe_strs[id][ll..][0..rl], bpe_strs[right][0..rl]);
+                bpe_strs[id][ll + rl] = 0;
+                bpe_str_len[id] = ll + rl;
+            } else {
+                bpe_str_len[id] = 0;
+            }
+        } else {
+            bpe_str_len[id] = 0;
+        }
+    }
+}
+
+fn isAlphaWord(s: []const u8) bool {
+    if (s.len < 2) return false;
+    for (s) |c| {
+        if (!((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z'))) return false;
+    }
+    return true;
+}
+
+fn extVocabFind(w: []const u8) i32 {
+    for (0..ext_vocab_n) |i| {
+        if (ext_vocab[i].word_len == w.len and std.mem.eql(u8, ext_vocab[i].word[0..ext_vocab[i].word_len], w)) {
+            return @intCast(i);
+        }
+    }
+    return -1;
+}
+
+fn initExtVocab() void {
+    const stdout_w = (std.fs.File{ .handle = std.posix.STDOUT_FILENO }).deprecatedWriter();
+    ext_vocab_n = 0;
+
+    // 1. Add all 1984 hardcoded words
+    for (0..NWORDS) |i| {
+        if (ext_vocab_n >= MAX_EXT_VOCAB) break;
+        var ew = &ext_vocab[ext_vocab_n];
+        const wlen = @min(VOCAB[i].len, 63);
+        @memcpy(ew.word[0..wlen], VOCAB[i][0..wlen]);
+        ew.word[wlen] = 0;
+        ew.word_len = wlen;
+        const bl = vocab_bpe_len[i];
+        for (0..bl) |b| {
+            ew.bpe_ids[b] = @intCast(vocab_bpe[i][b]);
+        }
+        ew.bpe_len = bl;
+        ew.from_hardcoded = true;
+        ext_vocab_n += 1;
+    }
+
+    // 2. Add BPE tokens that decode to whole words (not already in vocab)
+    for (0..BPE_VOCAB) |t| {
+        if (ext_vocab_n >= MAX_EXT_VOCAB) break;
+        const sl = bpe_str_len[t];
+        if (sl < 2 or sl >= 64) continue;
+        if (!isAlphaWord(bpe_strs[t][0..sl])) continue;
+        // lowercase for comparison
+        var lower: [64]u8 = undefined;
+        for (0..sl) |ci| {
+            lower[ci] = if (bpe_strs[t][ci] >= 'A' and bpe_strs[t][ci] <= 'Z')
+                bpe_strs[t][ci] + 32
+            else
+                bpe_strs[t][ci];
+        }
+        lower[sl] = 0;
+        if (extVocabFind(lower[0..sl]) >= 0) continue;
+        var ew = &ext_vocab[ext_vocab_n];
+        @memcpy(ew.word[0..sl], lower[0..sl]);
+        ew.word[sl] = 0;
+        ew.word_len = sl;
+        ew.bpe_ids[0] = @intCast(t);
+        ew.bpe_len = 1;
+        ew.from_hardcoded = false;
+        ext_vocab_n += 1;
+    }
+
+    stdout_w.print("  extended vocab: {d} words ({d} hardcoded + {d} from BPE)\n", .{
+        ext_vocab_n, NWORDS, ext_vocab_n - NWORDS,
+    }) catch {};
+}
+
+/// Compute word-level scores from BPE logits:
+/// word_score(w) = mean(bpe_logits[tok] for tok in word's BPE tokens)
+fn bpeLogitsToWordScores(bpe_logits: []const f32, word_scores: []f32, n_words_out: usize) void {
+    for (0..n_words_out) |w| {
+        if (w < NWORDS) {
+            // hardcoded vocab word
+            var score: f32 = 0;
+            const bl = vocab_bpe_len[w];
+            for (0..bl) |b| {
+                const tok: usize = @intCast(vocab_bpe[w][b]);
+                if (tok < BPE_VOCAB) score += bpe_logits[tok];
+            }
+            word_scores[w] = if (bl > 0) score / @as(f32, @floatFromInt(bl)) else 0;
+        } else if (w < ext_vocab_n) {
+            // extended vocab word
+            var score: f32 = 0;
+            const bl = ext_vocab[w].bpe_len;
+            for (0..bl) |b| {
+                const tok: usize = @intCast(ext_vocab[w].bpe_ids[b]);
+                if (tok < BPE_VOCAB) score += bpe_logits[tok];
+            }
+            word_scores[w] = if (bl > 0) score / @as(f32, @floatFromInt(bl)) else 0;
+        }
     }
 }
 
@@ -2865,7 +3197,7 @@ fn coocGet(a_in: i32, b_in: i32) f32 {
 }
 
 fn updateChambers(step_idx: usize) void {
-    const depth = @as(f32, @floatFromInt(step_idx)) / @as(f32, @floatFromInt(NSTEPS));
+    const depth = @as(f32, @floatFromInt(step_idx)) / @as(f32, @floatFromInt(N_LAYERS));
     const phase: usize = if (depth < 0.33) 0 else if (depth < 0.66) 1 else 2;
     if (phase == 0) chambers[CH_FLOW] += 0.05;
     if (phase == 1) chambers[CH_FEAR] += 0.04;
@@ -2886,7 +3218,7 @@ fn updateChambers(step_idx: usize) void {
     }
 }
 
-fn darioOverlay(logits: []f32, ctx: []const i32, step: usize) void {
+fn darioOverlay(word_logits: []f32, ctx: []const i32, step: usize) void {
     _ = step;
     const alpha_mod = 1 + 0.3 * chambers[CH_LOVE] - 0.2 * chambers[CH_RAGE] + 0.1 * chambers[CH_FLOW];
     const gamma_mod = 1 + 0.4 * chambers[CH_VOID] + 0.2 * chambers[CH_COMPLEX];
@@ -2902,11 +3234,11 @@ fn darioOverlay(logits: []f32, ctx: []const i32, step: usize) void {
             H += coocGet(ctx[i], @intCast(v));
         }
         if (H > 1) H = 1;
-        logits[v] += alpha_mod * 0.3 * H;
+        word_logits[v] += alpha_mod * 0.3 * H;
 
         // F: prophecy
         if (prophecy_target >= 0 and v == @as(usize, @intCast(prophecy_target))) {
-            logits[v] += 0.5 * @log(1.0 + @as(f32, @floatFromInt(prophecy_age)));
+            word_logits[v] += 0.5 * @log(1.0 + @as(f32, @floatFromInt(prophecy_age)));
         }
 
         // A: destiny
@@ -2915,12 +3247,12 @@ fn darioOverlay(logits: []f32, ctx: []const i32, step: usize) void {
         for (0..8) |i| {
             if (@abs(destiny[i]) > d_max) d_max = @abs(destiny[i]);
         }
-        logits[v] += gamma_mod * 0.25 * destiny[cat] / d_max;
+        word_logits[v] += gamma_mod * 0.25 * destiny[cat] / d_max;
     }
 }
 
 // ═══════════════════════════════════════════════════════════════
-// TOKENIZE — extract vocab word IDs from text
+// TOKENIZE — map text words to 1984-vocab IDs (for training targets)
 // ═══════════════════════════════════════════════════════════════
 
 fn isDelimiter(c: u8) bool {
@@ -2932,14 +3264,6 @@ fn isDelimiter(c: u8) bool {
 
 // ═══════════════════════════════════════════════════════════════
 // BPE INPUT — stem + greedy longest vocab match
-//
-// Three-stage tokenizer for arbitrary text:
-//   1. Exact vocab match     ("fire" → fire)
-//   2. Suffix stripping       ("burning" → burn, "created" → create)
-//   3. Greedy decomposition   ("heartbreak" → heart + break)
-//
-// The 1984 vocab words ARE the BPE token vocabulary.
-// Greedy longest-match IS BPE encoding.
 // ═══════════════════════════════════════════════════════════════
 
 const SUFFIXES = [_][]const u8{
@@ -2950,7 +3274,6 @@ const SUFFIXES = [_][]const u8{
     "ly",   "er",   "ed",   "est",  "al",   "en",   "es",   "s",
 };
 
-/// Precomputed vocab word lengths for greedy match.
 const vocab_lens = blk: {
     var lens: [NWORDS]usize = undefined;
     for (0..NWORDS) |i| {
@@ -2959,8 +3282,6 @@ const vocab_lens = blk: {
     break :blk lens;
 };
 
-/// Try stripping an English suffix and matching the stem in VOCAB.
-/// Returns vocab index or -1 on failure.
 fn tryStem(word: []const u8) i32 {
     var stem_buf: [64]u8 = undefined;
     const wlen = word.len;
@@ -2973,16 +3294,13 @@ fn tryStem(word: []const u8) i32 {
         const sl = wlen - slen;
         @memcpy(stem_buf[0..sl], word[0..sl]);
 
-        // exact stem
         const idx = findWord(stem_buf[0..sl]);
         if (idx >= 0) return idx;
 
-        // stem + 'e' (creat→create, danc→dance)
         stem_buf[sl] = 'e';
         const idx_e = findWord(stem_buf[0 .. sl + 1]);
         if (idx_e >= 0) return idx_e;
 
-        // doubled consonant (runn→run, swimm→swim)
         if (sl >= 3 and stem_buf[sl - 1] == stem_buf[sl - 2]) {
             const idx_d = findWord(stem_buf[0 .. sl - 1]);
             if (idx_d >= 0) return idx_d;
@@ -2991,8 +3309,6 @@ fn tryStem(word: []const u8) i32 {
     return -1;
 }
 
-/// Greedy longest vocab match within a word (BPE decomposition).
-/// Returns number of token ids written.
 fn greedyVocabMatch(word: []const u8, ids: []i32) usize {
     var n: usize = 0;
     var pos: usize = 0;
@@ -3020,30 +3336,22 @@ fn greedyVocabMatch(word: []const u8, ids: []i32) usize {
 
 fn tokenizeVocab(text: []const u8, ids: []i32) usize {
     var buf: [4096]u8 = undefined;
-    var bi: usize = 0;
-    for (text) |c| {
-        if (bi >= 4094) break;
-        buf[bi] = std.ascii.toLower(c);
-        bi += 1;
-    }
-    const input = buf[0..bi];
+    const len = @min(text.len, buf.len);
+    for (0..len) |i| buf[i] = std.ascii.toLower(text[i]);
 
     var n: usize = 0;
-    var i: usize = 0;
-    while (i < input.len and n < ids.len) {
-        // skip non-alpha
-        while (i < input.len and !std.ascii.isAlphabetic(input[i])) : (i += 1) {}
-        if (i >= input.len) break;
+    var pos: usize = 0;
+    while (pos < len and n < ids.len) {
+        while (pos < len and !std.ascii.isAlphabetic(buf[pos])) : (pos += 1) {}
+        if (pos >= len) break;
 
-        // extract word
-        const tok_start = i;
-        while (i < input.len and std.ascii.isAlphabetic(input[i])) : (i += 1) {}
-        const word = input[tok_start..i];
-
+        const tok_start = pos;
+        while (pos < len and std.ascii.isAlphabetic(buf[pos])) : (pos += 1) {}
+        const word = buf[tok_start..pos];
         if (word.len < 2 or isStop(word)) continue;
 
         // 1. exact vocab match
-        const idx = findWord(word);
+        var idx = findWord(word);
         if (idx >= 0) {
             ids[n] = idx;
             n += 1;
@@ -3051,20 +3359,20 @@ fn tokenizeVocab(text: []const u8, ids: []i32) usize {
         }
 
         // 2. stem + match
-        const stem_idx = tryStem(word);
-        if (stem_idx >= 0) {
-            ids[n] = stem_idx;
+        idx = tryStem(word);
+        if (idx >= 0) {
+            ids[n] = idx;
             n += 1;
             continue;
         }
 
-        // 3. greedy longest vocab match (BPE decomposition)
+        // 3. greedy longest vocab match
         var sub: [8]i32 = undefined;
         const ns = greedyVocabMatch(word, &sub);
-        for (sub[0..ns]) |sid| {
+        for (0..ns) |si| {
             if (n >= ids.len) break;
-            if (n == 0 or ids[n - 1] != sid) {
-                ids[n] = sid;
+            if (n == 0 or ids[n - 1] != sub[si]) {
+                ids[n] = sub[si];
                 n += 1;
             }
         }
@@ -3073,97 +3381,18 @@ fn tokenizeVocab(text: []const u8, ids: []i32) usize {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// DUAL TOKENIZATION — produces both vocab IDs and BPE sequences per word
-// ═══════════════════════════════════════════════════════════════
-
-const TrainTokens = struct {
-    word_ids: []i32, // 1984-vocab ID per word (for targets)
-    bpe_flat: []i32, // all BPE tokens concatenated
-    bpe_offset: []usize, // start index in bpe_flat for each word
-    bpe_len: []usize, // number of BPE tokens per word
-    n_words: usize, // total words
-};
-
-fn tokenizeForTraining(text: []const u8, allocator: std.mem.Allocator) !TrainTokens {
-    const len = text.len;
-
-    // lowercase copy
-    const buf = try allocator.alloc(u8, len);
-    defer allocator.free(buf);
-    for (0..len) |i| {
-        buf[i] = std.ascii.toLower(text[i]);
-    }
-
-    const max_words = len / 2 + 1;
-    var t = TrainTokens{
-        .word_ids = try allocator.alloc(i32, max_words),
-        .bpe_offset = try allocator.alloc(usize, max_words),
-        .bpe_len = try allocator.alloc(usize, max_words),
-        .bpe_flat = try allocator.alloc(i32, len),
-        .n_words = 0,
-    };
-
-    var bpe_pos: usize = 0;
-    var pos: usize = 0;
-    while (pos < len) {
-        // skip non-alpha
-        while (pos < len and !std.ascii.isAlphabetic(buf[pos])) : (pos += 1) {}
-        if (pos >= len) break;
-
-        // extract word
-        const tok_start = pos;
-        while (pos < len and std.ascii.isAlphabetic(buf[pos])) : (pos += 1) {}
-        const word = buf[tok_start..pos];
-
-        if (word.len < 2 or isStop(word)) continue;
-
-        // get vocab ID
-        var vid = findWord(word);
-        if (vid < 0) vid = tryStem(word);
-        if (vid < 0) {
-            var sub: [8]i32 = undefined;
-            const ns = greedyVocabMatch(word, &sub);
-            if (ns > 0) vid = sub[0]; // take first match as representative
-        }
-        if (vid < 0) continue; // skip unknown words
-
-        // get BPE encoding of the word text
-        var bpe_ids: [64]u16 = undefined;
-        const bpe_n = bpeEncode(word, &bpe_ids);
-
-        const w = t.n_words;
-        t.word_ids[w] = vid;
-        t.bpe_offset[w] = bpe_pos;
-        t.bpe_len[w] = bpe_n;
-        for (0..bpe_n) |bi| {
-            t.bpe_flat[bpe_pos + bi] = @intCast(bpe_ids[bi]);
-        }
-        bpe_pos += bpe_n;
-        t.n_words += 1;
-    }
-
-    return t;
-}
-
-fn freeTrainTokens(t: *TrainTokens, allocator: std.mem.Allocator) void {
-    allocator.free(t.word_ids);
-    allocator.free(t.bpe_flat);
-    allocator.free(t.bpe_offset);
-    allocator.free(t.bpe_len);
-}
-
-// ═══════════════════════════════════════════════════════════════
-// TRAINING — next-word prediction, step s predicts word[s+1]
+// TRAINING — next-token prediction (BPE-level), loss monitoring
 //
-// Dual tokenization: BPE for input context, 1984-vocab for targets.
+// Simplified trainer: forward-only loss + embedding nudge.
+// For full training, use PyTorch with PEN7 weight export.
 // ═══════════════════════════════════════════════════════════════
 
 fn train(m: *Model, data_path: []const u8, train_steps_count: i32, lr: f32, allocator: std.mem.Allocator) !void {
-    const stderr = (std.fs.File{ .handle = std.posix.STDERR_FILENO }).deprecatedWriter();
+    const stderr_w = (std.fs.File{ .handle = std.posix.STDERR_FILENO }).deprecatedWriter();
     const stdout_w = (std.fs.File{ .handle = std.posix.STDOUT_FILENO }).deprecatedWriter();
 
     const file = std.fs.cwd().openFile(data_path, .{}) catch {
-        try stderr.print("  cannot open {s}\n", .{data_path});
+        try stderr_w.print("  cannot open {s}\n", .{data_path});
         return;
     };
     defer file.close();
@@ -3173,227 +3402,93 @@ fn train(m: *Model, data_path: []const u8, train_steps_count: i32, lr: f32, allo
     defer allocator.free(text);
     _ = try file.deprecatedReader().readAll(text);
 
-    // Dual tokenization
-    var tok = try tokenizeForTraining(text, allocator);
-    defer freeTrainTokens(&tok, allocator);
+    // BPE tokenize entire corpus
+    const corpus_bpe = try allocator.alloc(i32, fsz);
+    defer allocator.free(corpus_bpe);
+    var bpe_ids_tmp: [MAX_BPE_SEQ]u16 = undefined;
+    const corpus_len_u16 = bpeEncode(text, &bpe_ids_tmp);
+    // Copy u16 -> i32
+    var corpus_len: usize = 0;
+    for (0..corpus_len_u16) |ci| {
+        if (corpus_len >= fsz) break;
+        corpus_bpe[corpus_len] = @intCast(bpe_ids_tmp[ci]);
+        corpus_len += 1;
+    }
 
-    const window: usize = NSTEPS + 1;
-    if (tok.n_words < window + 1) {
-        try stderr.print("  corpus too small: {d} words (need {d}+)\n", .{ tok.n_words, window + 1 });
+    if (corpus_len < MAX_SEQ + 1) {
+        try stderr_w.print("  corpus too small: {d} BPE tokens (need {d}+)\n", .{ corpus_len, MAX_SEQ + 1 });
         return;
     }
 
-    try stdout_w.print("  corpus: {d} bytes -> {d} vocab words\n", .{ fsz, tok.n_words });
+    try stdout_w.print("  corpus: {d} bytes -> {d} BPE tokens\n", .{ fsz, corpus_len });
     try stdout_w.print("  model: {d} params ({d:.1}MB f32)\n", .{
         totalParamCount(),
         @as(f64, @floatFromInt(totalParamCount())) * 4.0 / 1e6,
     });
-    try stdout_w.print("  optimizer: Adam (Chuck lineage) b1={d:.1} b2={d:.3}\n", .{ ADAM_B1, ADAM_B2 });
-    try stdout_w.print("  training: {d} steps, lr={e}\n", .{ train_steps_count, lr });
+    try stdout_w.print("  architecture: {d} layers, {d} heads, dim={d}, hdim={d}\n", .{ N_LAYERS, N_HEADS, DIM, HDIM });
+    try stdout_w.print("  training: {d} steps, lr={e}, seq={d}\n", .{ train_steps_count, lr, MAX_SEQ });
+    try stdout_w.print("  NOTE: C/Zig trainer uses forward-only loss (for PyTorch training, export weights)\n", .{});
 
-    // alloc scratch buffers
-    const logits = try allocator.alloc(f32, NWORDS);
+    const logits = try allocator.alloc(f32, BPE_VOCAB);
     defer allocator.free(logits);
-    const probs = try allocator.alloc(f32, NWORDS);
+    const probs = try allocator.alloc(f32, BPE_VOCAB);
     defer allocator.free(probs);
-    const d_logits = try allocator.alloc(f32, NWORDS);
-    defer allocator.free(d_logits);
-    const d_out = try allocator.alloc(f32, DIM);
-    defer allocator.free(d_out);
-    const query = try allocator.alloc(f32, DIM);
-    defer allocator.free(query);
-    const query_n = try allocator.alloc(f32, DIM);
-    defer allocator.free(query_n);
-    const gate_buf = try allocator.alloc(f32, HDIM);
-    defer allocator.free(gate_buf);
-    const up_buf = try allocator.alloc(f32, HDIM);
-    defer allocator.free(up_buf);
-    const swiglu_buf = try allocator.alloc(f32, HDIM);
-    defer allocator.free(swiglu_buf);
-    const hidden = try allocator.alloc(f32, DIM);
-    defer allocator.free(hidden);
-    const out = try allocator.alloc(f32, DIM);
-    defer allocator.free(out);
-    const d_swiglu = try allocator.alloc(f32, HDIM);
-    defer allocator.free(d_swiglu);
-    const ctx = try allocator.alloc(f32, DIM);
-    defer allocator.free(ctx);
-
-    // gradient accumulators
-    const g_embed_in = try allocZeroed(allocator, BPE_VOCAB * DIM);
-    defer allocator.free(g_embed_in);
-    const g_embed_out = try allocZeroed(allocator, NWORDS * DIM);
-    defer allocator.free(g_embed_out);
-
-    // temp buffer for collecting BPE tokens from context words
-    const ctx_bpe = try allocator.alloc(i32, MAX_BPE_SEQ);
-    defer allocator.free(ctx_bpe);
-
-    var g_wr: [NSTEPS][]f32 = undefined;
-    var g_gate: [NSTEPS][]f32 = undefined;
-    var g_up: [NSTEPS][]f32 = undefined;
-    var g_down: [NSTEPS][]f32 = undefined;
-    for (0..NSTEPS) |s| {
-        g_wr[s] = try allocZeroed(allocator, DIM * DIM);
-        g_gate[s] = try allocZeroed(allocator, DIM * HDIM);
-        g_up[s] = try allocZeroed(allocator, DIM * HDIM);
-        g_down[s] = try allocZeroed(allocator, HDIM * DIM);
-    }
-    defer {
-        for (0..NSTEPS) |s| {
-            allocator.free(g_wr[s]);
-            allocator.free(g_gate[s]);
-            allocator.free(g_up[s]);
-            allocator.free(g_down[s]);
-        }
-    }
-
     var best_loss: f32 = 1e9;
 
     var step: i32 = 1;
     while (step <= train_steps_count) : (step += 1) {
-        const start_pos = g_prng.random().uintLessThan(usize, tok.n_words - window);
+        // Sample a random window from corpus
+        var seq_len: usize = MAX_SEQ;
+        if (seq_len > corpus_len - 1) seq_len = corpus_len - 1;
+        const start_pos = g_prng.random().uintLessThan(usize, corpus_len - seq_len);
 
-        var total_loss: f32 = 0;
+        // Forward pass: predict next token from context
+        const ctx = corpus_bpe[start_pos..][0..seq_len];
+        const target: usize = @intCast(corpus_bpe[start_pos + seq_len]);
 
-        // zero grad accumulators
-        @memset(g_embed_in, 0);
-        @memset(g_embed_out, 0);
-        for (0..NSTEPS) |s| {
-            @memset(g_wr[s], 0);
-            @memset(g_gate[s], 0);
-            @memset(g_up[s], 0);
-            @memset(g_down[s], 0);
-        }
+        try forward(m, ctx, seq_len, logits, allocator);
+        softmaxV(logits, probs, BPE_VOCAB);
 
-        for (0..NSTEPS) |s| {
-            const ctx_n_words = s + 1; // number of context words
-            const target: usize = @intCast(tok.word_ids[start_pos + s + 1]);
-            const sw = &m.steps[s];
+        var p = probs[target];
+        if (p < 1e-10) p = 1e-10;
+        const loss = -@log(p);
 
-            // collect BPE tokens from context words
-            var bpe_n: usize = 0;
-            for (0..ctx_n_words) |w| {
-                if (bpe_n >= MAX_BPE_SEQ - 64) break;
-                const wi = start_pos + w;
-                const off = tok.bpe_offset[wi];
-                const bl = tok.bpe_len[wi];
-                @memcpy(ctx_bpe[bpe_n..][0..bl], tok.bpe_flat[off..][0..bl]);
-                bpe_n += bl;
-            }
-
-            // forward with BPE context
-            forwardStep(m, ctx_bpe[0..bpe_n], s, logits, query, query_n, gate_buf, up_buf, swiglu_buf, hidden, out);
-            softmaxV(logits, probs, NWORDS);
-
-            var p = probs[target];
-            if (p < 1e-10) p = 1e-10;
-            total_loss -= @log(p);
-
-            // d_logits = probs - one_hot(target)
-            @memcpy(d_logits, probs);
-            d_logits[target] -= 1.0;
-
-            // d_out from embed_out (separate output embed)
-            for (0..DIM) |j| {
-                var s_val: f32 = 0;
-                for (0..NWORDS) |v| {
-                    s_val += d_logits[v] * m.embed_out[v * DIM + j];
-                }
-                d_out[j] = s_val;
-            }
-
-            // accumulate embed_out gradient
-            for (0..NWORDS) |v| {
-                if (@abs(d_logits[v]) < 1e-8) continue;
-                for (0..DIM) |j| {
-                    g_embed_out[v * DIM + j] += d_logits[v] * out[j];
-                }
-            }
-
-            // backprop through w_down
-            matmulMtv(sw.w_down, d_out, d_swiglu, DIM, HDIM);
-            for (0..HDIM) |ii| {
-                for (0..DIM) |j| {
-                    g_down[s][ii * DIM + j] += swiglu_buf[ii] * d_out[j];
-                }
-            }
-
-            // backprop through SwiGLU
-            for (0..HDIM) |ii| {
-                const sg = siluf(gate_buf[ii]);
-                const sig: f32 = if (gate_buf[ii] > -20) 1.0 / (1.0 + @exp(-gate_buf[ii])) else 0;
-                const silu_grad: f32 = if (gate_buf[ii] > -20) sig * (1.0 + gate_buf[ii] * (1.0 - sig)) else 0;
-                const d_gate_i = d_swiglu[ii] * up_buf[ii] * silu_grad;
-                const d_up_i = d_swiglu[ii] * sg;
-
-                for (0..DIM) |j| {
-                    g_gate[s][ii * DIM + j] += d_gate_i * query_n[j];
-                    g_up[s][ii * DIM + j] += d_up_i * query_n[j];
-                }
-            }
-
-            // d_query (approx RMSNorm backward)
-            var ss: f32 = 0;
-            for (0..DIM) |ii| ss += query[ii] * query[ii];
-            ss = ss / @as(f32, @floatFromInt(DIM)) + 1e-5;
-            const inv = 1.0 / @sqrt(ss);
-            var d_query: [DIM]f32 = undefined;
-            for (0..DIM) |ii| {
-                d_query[ii] = d_out[ii] * sw.rms[ii] * inv;
-            }
-
-            // accumulate Wr gradient and get d_ctx
-            poolContext(m, ctx_bpe[0..bpe_n], ctx);
-            var d_ctx: [DIM]f32 = [_]f32{0} ** DIM;
-            for (0..DIM) |ii| {
-                if (@abs(d_query[ii]) < 1e-8) continue;
-                for (0..DIM) |j| {
-                    g_wr[s][ii * DIM + j] += d_query[ii] * ctx[j];
-                    d_ctx[j] += d_query[ii] * sw.wr[ii * DIM + j];
-                }
-            }
-
-            // backprop d_ctx through pool_context to embed_in
-            const inv_n: f32 = 1.0 / @as(f32, @floatFromInt(if (bpe_n > 0) bpe_n else 1));
-            for (0..bpe_n) |bi| {
-                const bpe_id: usize = @intCast(ctx_bpe[bi]);
-                for (0..DIM) |j| {
-                    g_embed_in[bpe_id * DIM + j] += d_ctx[j] * inv_n;
-                }
-            }
-        }
-
-        // Adam step
-        m.adam_t += 1;
-        const bc1 = 1.0 - std.math.pow(f32, ADAM_B1, @floatFromInt(m.adam_t));
-        const bc2 = 1.0 - std.math.pow(f32, ADAM_B2, @floatFromInt(m.adam_t));
-
-        adamUpdate(m.embed_in, m.embed_in_m, m.embed_in_v, g_embed_in, lr, bc1, bc2);
-        adamUpdate(m.embed_out, m.embed_out_m, m.embed_out_v, g_embed_out, lr, bc1, bc2);
-
-        for (0..NSTEPS) |s| {
-            adamUpdate(m.steps[s].wr, m.adam[s].wr_m, m.adam[s].wr_v, g_wr[s], lr, bc1, bc2);
-            adamUpdate(m.steps[s].w_gate, m.adam[s].gate_m, m.adam[s].gate_v, g_gate[s], lr, bc1, bc2);
-            adamUpdate(m.steps[s].w_up, m.adam[s].up_m, m.adam[s].up_v, g_up[s], lr, bc1, bc2);
-            adamUpdate(m.steps[s].w_down, m.adam[s].down_m, m.adam[s].down_v, g_down[s], lr, bc1, bc2);
-        }
-
-        const avg_loss = total_loss / @as(f32, @floatFromInt(NSTEPS));
-        if (avg_loss < best_loss) best_loss = avg_loss;
+        if (loss < best_loss) best_loss = loss;
 
         if (@mod(step, 50) == 0 or step == 1) {
-            try stdout_w.print("  step {d:>5}/{d}  loss={d:.4}  best={d:.4}\n", .{
-                step, train_steps_count, avg_loss, best_loss,
+            try stdout_w.print("  step {d:>5}/{d}  loss={d:.4}  best={d:.4}  (target={d} p={d:.4})\n", .{
+                step, train_steps_count, loss, best_loss, target, p,
             });
+        }
+
+        // Shallow gradient: nudge tok_emb for target toward context average
+        const scale_lr = lr * 0.1;
+        for (0..DIM) |d| {
+            var avg_ctx: f32 = 0;
+            const n_ctx: usize = if (seq_len < 8) seq_len else 8;
+            for (seq_len - n_ctx..seq_len) |ci| {
+                const tok_id: usize = @intCast(ctx[ci]);
+                avg_ctx += m.tok_emb[tok_id * DIM + d];
+            }
+            avg_ctx /= @as(f32, @floatFromInt(n_ctx));
+            m.tok_emb[target * DIM + d] += scale_lr * (avg_ctx - m.tok_emb[target * DIM + d]);
         }
     }
 
     try stdout_w.print("  training complete. best loss: {d:.4}\n", .{best_loss});
+    try stdout_w.print("  NOTE: for full training, use PyTorch with PEN7 weight export\n", .{});
 }
 
 // ═══════════════════════════════════════════════════════════════
-// GENERATION — 12 steps, each picks one word
+// GENERATION — autoregressive BPE, then word-level output
+//
+// Dual tokenizer: soul thinks in BPE (2048), mouth speaks in words (1984).
+// At each step:
+//   1. Forward pass -> BPE logits
+//   2. Compute word scores = mean(logits for word's BPE tokens)
+//   3. Apply Dario overlay on word scores
+//   4. Sample word, print it
+//   5. Append word's BPE tokens to context for next step
 // ═══════════════════════════════════════════════════════════════
 
 fn findSeed(key: []const u8) i32 {
@@ -3404,7 +3499,6 @@ fn findSeed(key: []const u8) i32 {
     var best_score: f32 = -1;
     for (0..NWORDS) |i| {
         var score: f32 = 0;
-        // Check if key contains vocab word or vice versa
         if (std.mem.indexOf(u8, VOCAB[i], key) != null or std.mem.indexOf(u8, key, VOCAB[i]) != null) {
             score = 3;
         }
@@ -3438,10 +3532,10 @@ fn extractKey(text: []const u8, out_buf: []u8) []const u8 {
     var best_start: usize = 0;
     var best_end: usize = 0;
     var best_len: usize = 0;
+    _ = best_end;
 
     var i: usize = 0;
     while (i < input.len) {
-        // skip whitespace
         while (i < input.len and (input[i] == ' ' or input[i] == '\t' or input[i] == '\n')) : (i += 1) {}
         if (i >= input.len) break;
         const tok_start = i;
@@ -3475,6 +3569,8 @@ fn runChain(m: *Model, text: []const u8, has_weights: bool, allocator: std.mem.A
     const key = extractKey(text, &key_buf);
     const seed = findSeed(key);
 
+    try stdout_w.print("\n  {s}\n", .{VOCAB[@intCast(seed)]});
+
     // prophecy
     const deep_cats = [_]usize{ 2, 5, 7 };
     const tcat = deep_cats[g_prng.random().uintLessThan(usize, 3)];
@@ -3493,136 +3589,205 @@ fn runChain(m: *Model, text: []const u8, has_weights: bool, allocator: std.mem.A
     if (pt >= @as(i32, NWORDS)) pt = @as(i32, NWORDS) - 1;
     prophecy_target = pt;
     prophecy_age = 0;
+    try stdout_w.print("  destined: {s}\n\n", .{VOCAB[@intCast(prophecy_target)]});
 
-    try stdout_w.print("\n  destined: {s}\n", .{VOCAB[@intCast(prophecy_target)]});
-    try stdout_w.print("\n  {s}\n", .{VOCAB[@intCast(seed)]});
-
-    var chain: [NSTEPS + 1]i32 = undefined;
-    var chain_n: usize = 0;
-    var forbidden: [NSTEPS + 100]i32 = undefined;
-    var nforbid: usize = 0;
-    chain[chain_n] = seed;
-    chain_n += 1;
-    forbidden[nforbid] = seed;
-    nforbid += 1;
-
-    // BPE token buffer for context - grows as words are added
+    // BPE context buffer
     var bpe_buf: [MAX_BPE_SEQ]i32 = undefined;
     var bpe_n: usize = 0;
-    // add seed word's BPE tokens
     const seed_idx: usize = @intCast(seed);
     for (0..vocab_bpe_len[seed_idx]) |bi| {
         bpe_buf[bpe_n] = @intCast(vocab_bpe[seed_idx][bi]);
         bpe_n += 1;
     }
 
-    var prev = seed;
+    // word-level chain for Dario field
+    var chain: [GEN_STEPS + 1]i32 = undefined;
+    var chain_n: usize = 0;
+    var forbidden: [GEN_STEPS + 100]i32 = undefined;
+    var nforbid: usize = 0;
+    chain[chain_n] = seed;
+    chain_n += 1;
+    forbidden[nforbid] = seed;
+    nforbid += 1;
 
     // scratch
-    const logits = try allocator.alloc(f32, NWORDS);
-    defer allocator.free(logits);
-    const probs = try allocator.alloc(f32, NWORDS);
+    const bpe_logits = try allocator.alloc(f32, BPE_VOCAB);
+    defer allocator.free(bpe_logits);
+    const gen_vocab: usize = if (has_weights) ext_vocab_n else NWORDS;
+    const word_scores = try allocator.alloc(f32, gen_vocab);
+    defer allocator.free(word_scores);
+    const probs = try allocator.alloc(f32, gen_vocab);
     defer allocator.free(probs);
-    const query = try allocator.alloc(f32, DIM);
-    defer allocator.free(query);
-    const query_n = try allocator.alloc(f32, DIM);
-    defer allocator.free(query_n);
-    const gate_buf = try allocator.alloc(f32, HDIM);
-    defer allocator.free(gate_buf);
-    const up_buf = try allocator.alloc(f32, HDIM);
-    defer allocator.free(up_buf);
-    const swiglu_buf = try allocator.alloc(f32, HDIM);
-    defer allocator.free(swiglu_buf);
-    const hidden = try allocator.alloc(f32, DIM);
-    defer allocator.free(hidden);
-    const out = try allocator.alloc(f32, DIM);
-    defer allocator.free(out);
 
     var fulfilled = false;
 
-    for (0..NSTEPS) |step| {
+    for (0..GEN_STEPS) |step| {
         updateChambers(step);
         prophecy_age += 1;
 
-        // learned logits - uses BPE context
+        // 1. Forward pass through all 8 layers -> BPE logits for last position
+        const ctx_len: usize = if (bpe_n < MAX_SEQ) bpe_n else MAX_SEQ;
+        const ctx_start: usize = if (bpe_n > MAX_SEQ) bpe_n - MAX_SEQ else 0;
+        try forward(m, bpe_buf[ctx_start..][0..ctx_len], ctx_len, bpe_logits, allocator);
+
+        // 2. Convert BPE logits to word-level scores
+        bpeLogitsToWordScores(bpe_logits, word_scores, gen_vocab);
+
+        // 3. Dario overlay on word scores (first NWORDS entries)
+        darioOverlay(word_scores[0..@min(NWORDS, gen_vocab)], chain[0..chain_n], step);
+
         if (has_weights) {
-            forwardStepTrained(m, bpe_buf[0..bpe_n], step, logits, query, query_n, gate_buf, up_buf, swiglu_buf, hidden, out);
-        } else {
-            forwardStep(m, bpe_buf[0..bpe_n], step, logits, query, query_n, gate_buf, up_buf, swiglu_buf, hidden, out);
-        }
-
-        // Dario field overlay
-        darioOverlay(logits, chain[0..chain_n], step);
-
-        // mask forbidden
-        for (0..nforbid) |f_i| {
-            logits[@intCast(forbidden[f_i])] = -1e9;
-        }
-
-        // top-k=12 sampling
-        softmaxV(logits, probs, NWORDS);
-
-        const Sc = struct { idx: i32, p: f32 };
-        var top: [12]Sc = undefined;
-        for (0..12) |ii| top[ii] = Sc{ .idx = 0, .p = -1 };
-
-        for (0..NWORDS) |w| {
-            for (0..12) |k| {
-                if (probs[w] > top[k].p) {
-                    var j: usize = 11;
-                    while (j > k) : (j -= 1) {
-                        top[j] = top[j - 1];
+            // mask forbidden by word string
+            for (0..ext_vocab_n) |w| {
+                for (0..nforbid) |fi| {
+                    const fw_idx: usize = @intCast(forbidden[fi]);
+                    const fw = if (fw_idx < NWORDS) VOCAB[fw_idx] else ext_vocab[fw_idx].word[0..ext_vocab[fw_idx].word_len];
+                    const cw = if (w < NWORDS) VOCAB[w] else ext_vocab[w].word[0..ext_vocab[w].word_len];
+                    if (std.mem.eql(u8, cw, fw)) {
+                        word_scores[w] = -1e9;
+                        break;
                     }
-                    top[k] = Sc{ .idx = @intCast(w), .p = probs[w] };
+                }
+            }
+
+            // top-k=12 sampling from ext_vocab_n
+            softmaxV(word_scores, probs, ext_vocab_n);
+            const Sc = struct { idx: i32, p: f32 };
+            var top: [12]Sc = undefined;
+            for (0..12) |ii| top[ii] = Sc{ .idx = 0, .p = -1 };
+
+            for (0..ext_vocab_n) |w| {
+                for (0..12) |ki| {
+                    if (probs[w] > top[ki].p) {
+                        var j: usize = 11;
+                        while (j > ki) : (j -= 1) {
+                            top[j] = top[j - 1];
+                        }
+                        top[ki] = Sc{ .idx = @intCast(w), .p = probs[w] };
+                        break;
+                    }
+                }
+            }
+            var total: f32 = 0.001;
+            for (0..12) |ii| total += if (top[ii].p > 0) top[ii].p else 0;
+            var r = randf() * total;
+            var pick = top[0].idx;
+            for (0..12) |ii| {
+                const pp = if (top[ii].p > 0) top[ii].p else 0;
+                r -= pp;
+                if (r <= 0) {
+                    pick = top[ii].idx;
                     break;
                 }
             }
-        }
 
-        var total: f32 = 0.001;
-        for (0..12) |ii| total += if (top[ii].p > 0) top[ii].p else 0;
-        var r = randf() * total;
-        var pick = top[0].idx;
-        for (0..12) |ii| {
-            const pp = if (top[ii].p > 0) top[ii].p else 0;
-            r -= pp;
-            if (r <= 0) {
-                pick = top[ii].idx;
-                break;
+            chain[chain_n] = pick;
+            chain_n += 1;
+            forbidden[nforbid] = pick;
+            nforbid += 1;
+
+            // append picked word's BPE tokens to context
+            const pick_idx: usize = @intCast(pick);
+            if (pick_idx < NWORDS) {
+                if (bpe_n + vocab_bpe_len[pick_idx] < MAX_BPE_SEQ) {
+                    for (0..vocab_bpe_len[pick_idx]) |bi| {
+                        bpe_buf[bpe_n] = @intCast(vocab_bpe[pick_idx][bi]);
+                        bpe_n += 1;
+                    }
+                }
+            } else if (pick_idx < ext_vocab_n) {
+                if (bpe_n + ext_vocab[pick_idx].bpe_len < MAX_BPE_SEQ) {
+                    for (0..ext_vocab[pick_idx].bpe_len) |bi| {
+                        bpe_buf[bpe_n] = ext_vocab[pick_idx].bpe_ids[bi];
+                        bpe_n += 1;
+                    }
+                }
             }
-        }
 
-        chain[chain_n] = pick;
-        chain_n += 1;
-        forbidden[nforbid] = pick;
-        nforbid += 1;
-
-        // append picked word's BPE tokens to buffer
-        const pick_idx: usize = @intCast(pick);
-        if (bpe_n + vocab_bpe_len[pick_idx] < MAX_BPE_SEQ) {
-            for (0..vocab_bpe_len[pick_idx]) |bi| {
-                bpe_buf[bpe_n] = @intCast(vocab_bpe[pick_idx][bi]);
-                bpe_n += 1;
+            // Dario field updates
+            if (pick_idx < NWORDS) {
+                coocUpdate(if (chain_n >= 2) chain[chain_n - 2] else seed, pick);
+                const cat = wordCategory(pick_idx);
+                destiny[cat] = 0.3 + 0.7 * destiny[cat];
+                if (pick == prophecy_target) fulfilled = true;
             }
-        }
 
-        coocUpdate(prev, pick);
-        const cat = wordCategory(@intCast(pick));
-        destiny[cat] = 0.3 + 0.7 * destiny[cat];
+            if (step > 7) {
+                trauma = if (trauma + 0.1 < 1) trauma + 0.1 else 1;
+            }
+            trauma *= 0.97;
 
-        if (pick == prophecy_target) fulfilled = true;
-
-        if (step > 7) {
-            trauma = if (trauma + 0.1 < 1) trauma + 0.1 else 1;
-        }
-        trauma *= 0.97;
-
-        if (step == NSTEPS - 1) {
-            try stdout_w.print("  *{s}\n", .{VOCAB[@intCast(pick)]});
+            const wname = if (pick_idx < NWORDS) VOCAB[pick_idx] else ext_vocab[pick_idx].word[0..ext_vocab[pick_idx].word_len];
+            if (step == GEN_STEPS - 1) {
+                try stdout_w.print("  *{s}\n", .{wname});
+            } else {
+                try stdout_w.print("   {s}\n", .{wname});
+            }
         } else {
-            try stdout_w.print("   {s}\n", .{VOCAB[@intCast(pick)]});
+            // WEIGHTLESS MODE: hardcoded 1984 words only
+            for (0..nforbid) |fi| {
+                const fidx: usize = @intCast(forbidden[fi]);
+                if (fidx < NWORDS) word_scores[fidx] = -1e9;
+            }
+
+            softmaxV(word_scores, probs, NWORDS);
+            const Sc2 = struct { idx: i32, p: f32 };
+            var top: [12]Sc2 = undefined;
+            for (0..12) |ii| top[ii] = Sc2{ .idx = 0, .p = -1 };
+            for (0..NWORDS) |w| {
+                for (0..12) |ki| {
+                    if (probs[w] > top[ki].p) {
+                        var j: usize = 11;
+                        while (j > ki) : (j -= 1) {
+                            top[j] = top[j - 1];
+                        }
+                        top[ki] = Sc2{ .idx = @intCast(w), .p = probs[w] };
+                        break;
+                    }
+                }
+            }
+            var total: f32 = 0.001;
+            for (0..12) |ii| total += if (top[ii].p > 0) top[ii].p else 0;
+            var r = randf() * total;
+            var pick = top[0].idx;
+            for (0..12) |ii| {
+                const pp = if (top[ii].p > 0) top[ii].p else 0;
+                r -= pp;
+                if (r <= 0) {
+                    pick = top[ii].idx;
+                    break;
+                }
+            }
+
+            chain[chain_n] = pick;
+            chain_n += 1;
+            forbidden[nforbid] = pick;
+            nforbid += 1;
+
+            const pick_idx: usize = @intCast(pick);
+            if (bpe_n + vocab_bpe_len[pick_idx] < MAX_BPE_SEQ) {
+                for (0..vocab_bpe_len[pick_idx]) |bi| {
+                    bpe_buf[bpe_n] = @intCast(vocab_bpe[pick_idx][bi]);
+                    bpe_n += 1;
+                }
+            }
+
+            coocUpdate(if (chain_n >= 2) chain[chain_n - 2] else seed, pick);
+            const cat = wordCategory(pick_idx);
+            destiny[cat] = 0.3 + 0.7 * destiny[cat];
+            if (pick == prophecy_target) fulfilled = true;
+
+            if (step > 7) {
+                trauma = if (trauma + 0.1 < 1) trauma + 0.1 else 1;
+            }
+            trauma *= 0.97;
+
+            if (step == GEN_STEPS - 1) {
+                try stdout_w.print("  *{s}\n", .{VOCAB[pick_idx]});
+            } else {
+                try stdout_w.print("   {s}\n", .{VOCAB[pick_idx]});
+            }
         }
-        prev = pick;
     }
 
     var cats_seen: usize = 0;
@@ -3653,8 +3818,10 @@ pub fn main() !void {
     const ts: u64 = @intCast(std.time.timestamp());
     g_prng = std.Random.DefaultPrng.init(ts);
 
-    // Precompute BPE encodings of vocab words (for generation)
+    // Precompute BPE encodings of vocab words
     initVocabBpe();
+    initBpeDecode();
+    initExtVocab();
 
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
@@ -3699,7 +3866,6 @@ pub fn main() !void {
                 @memcpy(textbuf[pos..][0..copy_len], a[0..copy_len]);
                 pos += copy_len;
             }
-            // We need to keep the text alive; copy to heap
             const heap_text = try allocator.alloc(u8, pos);
             @memcpy(heap_text, textbuf[0..pos]);
             text_input = heap_text;
@@ -3711,11 +3877,13 @@ pub fn main() !void {
     var model: Model = undefined;
     try modelInit(&model, allocator);
 
-    try stdout_w.print("\n  penelope \xe2\x80\x94 1984 words, {d} steps, Dario Equation\n", .{NSTEPS});
+    try stdout_w.print("\n  penelope v7 \xe2\x80\x94 Resonance engine. 1984 words. Dario Equation.\n", .{});
+    try stdout_w.print("  {d} layers, {d} heads, dim={d}, hdim={d}\n", .{ N_LAYERS, N_HEADS, DIM, HDIM });
     try stdout_w.print("  {d} trainable params ({d:.1}MB f32)\n", .{
         totalParamCount(),
         @as(f64, @floatFromInt(totalParamCount())) * 4.0 / 1e6,
     });
+    try stdout_w.print("  BPE input: {d} subword tokens, max_seq={d}\n", .{ BPE_VOCAB, MAX_SEQ });
     try stdout_w.print("  by Arianna Method\n\n", .{});
 
     var has_weights = false;
@@ -3731,6 +3899,8 @@ pub fn main() !void {
         }
     }
 
+    try stdout_w.print("  mode: {s}\n\n", .{if (has_weights) "trained (BPE word scores)" else "weightless (word-level)"});
+
     if (text_input) |txt| {
         try runChain(&model, txt, has_weights, allocator);
     } else if (train_path == null) {
@@ -3742,7 +3912,6 @@ pub fn main() !void {
                 error.EndOfStream => break,
                 else => return err,
             };
-            // trim trailing \r
             var trimmed = line;
             while (trimmed.len > 0 and (trimmed[trimmed.len - 1] == '\r' or trimmed[trimmed.len - 1] == '\n')) {
                 trimmed = trimmed[0 .. trimmed.len - 1];

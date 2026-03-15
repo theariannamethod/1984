@@ -2794,7 +2794,7 @@ static ExtWord ext_vocab[MAX_EXT_VOCAB];
 static int ext_vocab_n = 0;
 
 static int is_alpha_word(const char *s) {
-    if (!s[0] || !s[1]) return 0; /* min 2 chars */
+    if (!s[0] || !s[1] || !s[2]) return 0; /* min 3 chars — filters BPE fragments */
     for (int i = 0; s[i]; i++)
         if (!((s[i] >= 'a' && s[i] <= 'z') || (s[i] >= 'A' && s[i] <= 'Z')))
             return 0;

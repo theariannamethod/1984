@@ -1,34 +1,32 @@
-// penelope.ts — 1984 words. 12 steps of resonance. Dario Equation.
+// penelope.ts — v7 Resonance engine. 1984 words. Dario Equation.
 //
-// Trainable resonance engine. Not a transformer. A mirror that learns.
+// 8-layer sequential transformer with multi-head attention, RoPE,
+// RRPRAM resonance gates, and SwiGLU FFN. Dual tokenizer:
+// BPE input (2048 subwords), word-level output (1984 words).
 //
-// Input:  text → BPE subword tokens (2048-token byte-pair encoding)
-// Attend: RRPRAM resonance + SwiGLU per step (how it thinks)
-// Output: word-level from 1984 vocab (gibberish impossible)
+// Architecture per layer l:
+//     h = rmsnorm(x, attn_norm_l)
+//     qkv_out = MultiHeadAttention(h; wq_l, wk_l, wv_l, wo_l, RoPE)
+//     rrp = h @ wr_l                            RRPRAM resonance
+//     gate = softmax(gate_l[0], gate_l[1])
+//     x = x + gate[0]*qkv_out + gate[1]*rrp    gated residual
+//     h2 = rmsnorm(x, ffn_norm_l)
+//     x = x + SwiGLU(h2; w_gate_l, w_up_l, w_down_l)  residual
 //
-// 12 learned step-weights (~1.03M each). Each step has its own lens.
-// Step 1 sees the surface. Step 12 sees the bone.
+// After 8 layers:
+//     logits = rmsnorm(x, final_norm) @ lm_head^T
+//     word_score(w) = mean(logits[bpe_tokens(w)]) + DarioField
 //
-// Architecture per step s:
-//     context = pool(embed_in(BPE tokens))
-//     query   = RMSNorm(context @ Wr_s)          RRPRAM resonance
-//     hidden  = SwiGLU(query; gate_s, up_s, down_s)
-//     logits  = (query + hidden) @ E_out^T        separate output embed
-//     logits += DarioField(context)               live overlay
-//     word    = sample(softmax(logits))
-//
-// Total: ~14M params (786K embed_in + 762K embed_out + 12 × 1.03M steps)
-//
-//   score(w) = B + α·H + β·F + γ·A + T      (Dario Equation)
+//   score(w) = B + alpha*H + beta*F + gamma*A + T   (Dario Equation)
 //
 //   npx tsx penelope.ts                                  # interactive
 //   npx tsx penelope.ts "darkness eats the city"         # single chain
-//   npx tsx penelope.ts --train corpus.txt               # train
-//   npx tsx penelope.ts --train corpus.txt --steps 5000  # train N steps
+//   npx tsx penelope.ts --train corpus.txt               # train 5000 steps
+//   npx tsx penelope.ts --train corpus.txt --steps 1000  # train N steps
 //   npx tsx penelope.ts --load penelope.bin              # load weights
 //   npx tsx penelope.ts --save penelope.bin              # save after
 //
-// By Arianna Method. הרזוננס לא נשבר
+// By Arianna Method.
 
 import * as fs from "fs";
 import * as readline from "readline";
@@ -269,13 +267,22 @@ const VOCAB: string[] = [
 ];
 
 const V = VOCAB.length; // 1984
-const STEPS = 12;
-const D = 384;          // embedding dim
-const M = 768;          // SwiGLU hidden dim
 
-const BPE_VOCAB = 2048;
+const DIM       = 448;
+const HDIM      = 896;       // DIM * 2, SwiGLU hidden
+const N_HEADS   = 7;
+const HEAD_DIM  = 64;        // DIM / N_HEADS
+const N_LAYERS  = 8;         // sequential transformer layers
+const MAX_SEQ   = 256;
+const NWORDS    = 1984;
+const MAX_COOC  = 32768;
+
+const BPE_VOCAB  = 2048;
 const BPE_MERGES = 1792;
 const MAX_BPE_SEQ = 8192;
+
+const GEN_STEPS = 12;        // words to generate per chain
+const MAX_EXT_VOCAB = 4096;
 
 const BPE_TABLE: [number,number][] = [
   [115,32],
@@ -2218,173 +2225,369 @@ function softmax(x: number[]): number[] {
 
 
 // ═══════════════════════════════════════════════════════════════
-// MODEL — 12 step-specific weight sets + shared embedding
+// MODEL — v7 Resonance: 8 sequential layers, multi-head attention
+// + RoPE + RRPRAM gate + SwiGLU, then BPE logits
 // ═══════════════════════════════════════════════════════════════
 
-class StepWeights {
-  wr: number[];
-  rms: number[];
-  w_gate: number[];
-  w_up: number[];
-  w_down: number[];
+interface LayerWeights {
+  attn_norm: number[];   // [DIM]         pre-attention RMSNorm
+  wq: number[];          // [DIM * DIM]   query projection
+  wk: number[];          // [DIM * DIM]   key projection
+  wv: number[];          // [DIM * DIM]   value projection
+  wo: number[];          // [DIM * DIM]   output projection
+  wr: number[];          // [DIM * DIM]   RRPRAM resonance
+  gate: [number, number]; // blend QKV + RRPRAM
+  ffn_norm: number[];    // [DIM]         pre-FFN RMSNorm
+  w_gate: number[];      // [DIM * HDIM]  SwiGLU gate (note: HDIM > DIM)
+  w_up: number[];        // [DIM * HDIM]  SwiGLU up
+  w_down: number[];      // [HDIM * DIM]  SwiGLU down
+}
 
-  constructor() {
-    const scale_d = Math.sqrt(2.0 / D);
-    const scale_m = Math.sqrt(2.0 / M);
-    this.wr = new Array(D * D);
-    for (let i = 0; i < D * D; i++) this.wr[i] = randn() * scale_d;
-    this.rms = new Array(D).fill(1.0);
-    this.w_gate = new Array(D * M);
-    for (let i = 0; i < D * M; i++) this.w_gate[i] = randn() * scale_d;
-    this.w_up = new Array(D * M);
-    for (let i = 0; i < D * M; i++) this.w_up[i] = randn() * scale_d;
-    this.w_down = new Array(M * D);
-    for (let i = 0; i < M * D; i++) this.w_down[i] = randn() * scale_m;
+function layerParamCount(): number {
+  // attn_norm + wq + wk + wv + wo + wr + gate + ffn_norm + w_gate + w_up + w_down
+  return DIM + DIM * DIM * 5 + 2 + DIM + DIM * HDIM * 2 + HDIM * DIM;
+}
+
+function totalParamCount(): number {
+  const global = BPE_VOCAB * DIM + MAX_SEQ * DIM + DIM + BPE_VOCAB * DIM;
+  return global + N_LAYERS * layerParamCount();
+}
+
+function initLayer(): LayerWeights {
+  const scale_d = Math.sqrt(2.0 / DIM);
+  const scale_h = Math.sqrt(2.0 / HDIM);
+  const lw: LayerWeights = {
+    attn_norm: new Array(DIM).fill(1.0),
+    wq: new Array(DIM * DIM),
+    wk: new Array(DIM * DIM),
+    wv: new Array(DIM * DIM),
+    wo: new Array(DIM * DIM),
+    wr: new Array(DIM * DIM),
+    gate: [0.0, 0.0],
+    ffn_norm: new Array(DIM).fill(1.0),
+    w_gate: new Array(DIM * HDIM),
+    w_up: new Array(DIM * HDIM),
+    w_down: new Array(HDIM * DIM),
+  };
+  for (let i = 0; i < DIM * DIM; i++) lw.wq[i] = randn() * scale_d;
+  for (let i = 0; i < DIM * DIM; i++) lw.wk[i] = randn() * scale_d;
+  for (let i = 0; i < DIM * DIM; i++) lw.wv[i] = randn() * scale_d;
+  for (let i = 0; i < DIM * DIM; i++) lw.wo[i] = randn() * scale_d;
+  for (let i = 0; i < DIM * DIM; i++) lw.wr[i] = randn() * scale_d;
+  for (let i = 0; i < DIM * HDIM; i++) lw.w_gate[i] = randn() * scale_d;
+  for (let i = 0; i < DIM * HDIM; i++) lw.w_up[i] = randn() * scale_d;
+  for (let i = 0; i < HDIM * DIM; i++) lw.w_down[i] = randn() * scale_h;
+  return lw;
+}
+
+// Extended vocab entry
+interface ExtWord {
+  word: string;
+  bpe_ids: number[];
+  from_hardcoded: boolean;
+}
+
+let ext_vocab: ExtWord[] = [];
+
+function isAlphaWord(s: string): boolean {
+  if (s.length < 2) return false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (!((c >= 97 && c <= 122) || (c >= 65 && c <= 90))) return false;
+  }
+  return true;
+}
+
+// BPE decode table (built lazily)
+let bpe_strs: string[] = [];
+let bpe_strs_built = false;
+
+function buildBpeStrs(): void {
+  if (bpe_strs_built) return;
+  bpe_strs = new Array(BPE_VOCAB).fill("");
+  // first 256 = single bytes
+  for (let i = 0; i < 256; i++) bpe_strs[i] = String.fromCharCode(i);
+  // merges
+  for (let m = 0; m < BPE_MERGES; m++) {
+    const [a, b] = BPE_TABLE[m];
+    bpe_strs[256 + m] = bpe_strs[a] + bpe_strs[b];
+  }
+  bpe_strs_built = true;
+}
+
+function initExtVocab(): void {
+  buildBpeStrs();
+  ext_vocab = [];
+
+  // 1. Add all 1984 hardcoded words
+  for (let i = 0; i < NWORDS && ext_vocab.length < MAX_EXT_VOCAB; i++) {
+    ext_vocab.push({
+      word: VOCAB[i],
+      bpe_ids: [...vocabBpe[i]],
+      from_hardcoded: true,
+    });
   }
 
-  paramCount(): number {
-    return D * D + D + D * M + D * M + M * D;
+  // 2. Add BPE tokens that decode to whole words (not already in vocab)
+  const existing = new Set(ext_vocab.map(e => e.word));
+  for (let t = 0; t < BPE_VOCAB && ext_vocab.length < MAX_EXT_VOCAB; t++) {
+    if (!isAlphaWord(bpe_strs[t])) continue;
+    const lower = bpe_strs[t].toLowerCase();
+    if (existing.has(lower)) continue;
+    ext_vocab.push({
+      word: lower,
+      bpe_ids: [t],
+      from_hardcoded: false,
+    });
+    existing.add(lower);
   }
 
-  params(): number[] {
-    const out: number[] = [];
-    for (let i = 0; i < this.wr.length; i++) out.push(this.wr[i]);
-    for (let i = 0; i < this.rms.length; i++) out.push(this.rms[i]);
-    for (let i = 0; i < this.w_gate.length; i++) out.push(this.w_gate[i]);
-    for (let i = 0; i < this.w_up.length; i++) out.push(this.w_up[i]);
-    for (let i = 0; i < this.w_down.length; i++) out.push(this.w_down[i]);
-    return out;
-  }
+  console.log(`  extended vocab: ${ext_vocab.length} words (${NWORDS} hardcoded + ${ext_vocab.length - NWORDS} from BPE)`);
+}
 
-  loadFrom(flat: number[], offset: number): number {
-    let o = offset;
-    this.wr = flat.slice(o, o + D * D); o += D * D;
-    this.rms = flat.slice(o, o + D); o += D;
-    this.w_gate = flat.slice(o, o + D * M); o += D * M;
-    this.w_up = flat.slice(o, o + D * M); o += D * M;
-    this.w_down = flat.slice(o, o + M * D); o += M * D;
-    return o;
+
+// RoPE: apply rotary position embedding to q and k
+// q, k: flat arrays [seq_len * n_heads * head_dim] laid out as [t][h][d]
+function applyRope(q: number[], k: number[], seqLen: number): void {
+  const thetaBase = 10000.0;
+  for (let t = 0; t < seqLen; t++) {
+    for (let h = 0; h < N_HEADS; h++) {
+      const off = (t * N_HEADS + h) * HEAD_DIM;
+      for (let d = 0; d < HEAD_DIM / 2; d++) {
+        const freq = 1.0 / Math.pow(thetaBase, 2.0 * d / HEAD_DIM);
+        const cos_f = Math.cos(t * freq);
+        const sin_f = Math.sin(t * freq);
+        // rotate q
+        const q0 = q[off + d], q1 = q[off + d + HEAD_DIM / 2];
+        q[off + d]                = q0 * cos_f - q1 * sin_f;
+        q[off + d + HEAD_DIM / 2] = q0 * sin_f + q1 * cos_f;
+        // rotate k
+        const k0 = k[off + d], k1 = k[off + d + HEAD_DIM / 2];
+        k[off + d]                = k0 * cos_f - k1 * sin_f;
+        k[off + d + HEAD_DIM / 2] = k0 * sin_f + k1 * cos_f;
+      }
+    }
   }
 }
 
 
 class Penelope {
-  embed_in: number[];   // [BPE_VOCAB * D] input BPE embedding
-  embed_out: number[];  // [V * D]         output word embedding
-  steps: StepWeights[];
+  tok_emb: number[];     // [BPE_VOCAB * DIM]  token embedding
+  pos_emb: number[];     // [MAX_SEQ * DIM]    positional embedding
+  final_norm: number[];  // [DIM]              final RMSNorm
+  lm_head: number[];     // [BPE_VOCAB * DIM]  language model head
+  layers: LayerWeights[];
 
   constructor() {
+    const scale_d = Math.sqrt(2.0 / DIM);
     const scale_bpe = Math.sqrt(2.0 / BPE_VOCAB);
-    const scale_v = Math.sqrt(2.0 / V);
-    this.embed_in = new Array(BPE_VOCAB * D);
-    for (let i = 0; i < BPE_VOCAB * D; i++) this.embed_in[i] = randn() * scale_bpe;
-    this.embed_out = new Array(V * D);
-    for (let i = 0; i < V * D; i++) this.embed_out[i] = randn() * scale_v;
-    this.steps = [];
-    for (let i = 0; i < STEPS; i++) this.steps.push(new StepWeights());
+
+    this.tok_emb = new Array(BPE_VOCAB * DIM);
+    for (let i = 0; i < BPE_VOCAB * DIM; i++) this.tok_emb[i] = randn() * scale_bpe;
+
+    this.pos_emb = new Array(MAX_SEQ * DIM);
+    for (let i = 0; i < MAX_SEQ * DIM; i++) this.pos_emb[i] = randn() * 0.02;
+
+    this.final_norm = new Array(DIM).fill(1.0);
+
+    this.lm_head = new Array(BPE_VOCAB * DIM);
+    for (let i = 0; i < BPE_VOCAB * DIM; i++) this.lm_head[i] = randn() * scale_d;
+
+    this.layers = [];
+    for (let l = 0; l < N_LAYERS; l++) this.layers.push(initLayer());
   }
 
   paramCount(): number {
-    let total = BPE_VOCAB * D + V * D;
-    for (const s of this.steps) total += s.paramCount();
-    return total;
+    return totalParamCount();
   }
 
-  getEmbedIn(idx: number): number[] {
-    return this.embed_in.slice(idx * D, (idx + 1) * D);
-  }
+  // Full forward pass through all 8 layers for a sequence of BPE tokens.
+  // Returns logits[BPE_VOCAB] for the LAST token position.
+  forward(bpe_ids: number[], seq_len_in: number): number[] {
+    let S = seq_len_in;
+    if (S < 1) S = 1;
+    if (S > MAX_SEQ) S = MAX_SEQ;
 
-  getEmbedOut(idx: number): number[] {
-    return this.embed_out.slice(idx * D, (idx + 1) * D);
-  }
+    // x: [S * DIM] residual stream
+    const x = new Array(S * DIM).fill(0.0);
 
-  poolContext(bpeIds: number[]): number[] {
-    if (bpeIds.length === 0) return zeros(D);
-    const ctx = zeros(D);
-    for (const bid of bpeIds) {
-      for (let j = 0; j < D; j++) ctx[j] += this.embed_in[bid * D + j];
+    // embed: tok_emb + pos_emb
+    for (let t = 0; t < S; t++) {
+      let tok = bpe_ids[t];
+      if (tok < 0 || tok >= BPE_VOCAB) tok = 0;
+      for (let d = 0; d < DIM; d++)
+        x[t * DIM + d] = this.tok_emb[tok * DIM + d] + this.pos_emb[t * DIM + d];
     }
-    const inv = 1.0 / bpeIds.length;
-    for (let j = 0; j < D; j++) ctx[j] *= inv;
-    return ctx;
-  }
 
-  forwardStep(bpeIds: number[], stepIdx: number): number[] {
-    const sw = this.steps[stepIdx];
-    const ctx = this.poolContext(bpeIds);
+    // scratch buffers
+    const h   = new Array(S * DIM);
+    const q   = new Array(S * DIM);
+    const k   = new Array(S * DIM);
+    const v   = new Array(S * DIM);
+    const att  = new Array(S * S * N_HEADS);
+    const av   = new Array(S * DIM);
+    const qkv_out = new Array(S * DIM);
+    const rrp  = new Array(S * DIM);
+    const h2   = new Array(S * DIM);
+    const fg   = new Array(S * HDIM);
+    const fu   = new Array(S * HDIM);
+    const sw   = new Array(S * HDIM);
+    const fd   = new Array(S * DIM);
 
-    // RRPRAM resonance
-    let query = matmul_mv(sw.wr, ctx, D, D);
+    for (let l = 0; l < N_LAYERS; l++) {
+      const lw = this.layers[l];
 
-    // RMSNorm
-    query = rmsnorm(query, sw.rms, D);
-
-    // SwiGLU
-    const gate = matmul_mv(sw.w_gate, query, M, D);
-    const up = matmul_mv(sw.w_up, query, M, D);
-    const swiglu = new Array(M);
-    for (let i = 0; i < M; i++) swiglu[i] = silu(gate[i]) * up[i];
-    const hidden = matmul_mv(sw.w_down, swiglu, D, M);
-
-    // Residual
-    const out = vadd(query, hidden);
-
-    // Logits = E_out @ out (separate output embed, weightless mode)
-    const logits = matmul_mv(this.embed_out, out, V, D);
-    return logits;
-  }
-
-  forwardStepTrained(bpeIds: number[], stepIdx: number): number[] {
-    const sw = this.steps[stepIdx];
-    const ctx = this.poolContext(bpeIds);
-
-    let query = matmul_mv(sw.wr, ctx, D, D);
-    query = rmsnorm(query, sw.rms, D);
-    const gate = matmul_mv(sw.w_gate, query, M, D);
-    const up = matmul_mv(sw.w_up, query, M, D);
-    const swiglu = new Array(M);
-    for (let i = 0; i < M; i++) swiglu[i] = silu(gate[i]) * up[i];
-    const hidden = matmul_mv(sw.w_down, swiglu, D, M);
-    const out = vadd(query, hidden);
-
-    // Word-level logits from BPE weights: score each word by its BPE tokens
-    const logits = new Array(V);
-    for (let w = 0; w < V; w++) {
-      const bl = vocabBpe[w].length;
-      let score = 0;
-      for (let b = 0; b < bl; b++) {
-        const tok = vocabBpe[w][b];
-        let dot = 0;
-        for (let j = 0; j < D; j++)
-          dot += this.embed_in[tok * D + j] * out[j];
-        score += dot;
+      // 1. h = rmsnorm(x, attn_norm) for each position
+      for (let t = 0; t < S; t++) {
+        const xSlice = x.slice(t * DIM, (t + 1) * DIM);
+        const normed = rmsnorm(xSlice, lw.attn_norm, DIM);
+        for (let d = 0; d < DIM; d++) h[t * DIM + d] = normed[d];
       }
-      logits[w] = bl > 0 ? score / bl : 0;
+
+      // 2-3. q = h @ wq, k = h @ wk, v = h @ wv (per position)
+      for (let t = 0; t < S; t++) {
+        const ht = h.slice(t * DIM, (t + 1) * DIM);
+        const qt = matmul_mv(lw.wq, ht, DIM, DIM);
+        const kt = matmul_mv(lw.wk, ht, DIM, DIM);
+        const vt = matmul_mv(lw.wv, ht, DIM, DIM);
+        for (let d = 0; d < DIM; d++) {
+          q[t * DIM + d] = qt[d];
+          k[t * DIM + d] = kt[d];
+          v[t * DIM + d] = vt[d];
+        }
+      }
+
+      // Apply RoPE to q and k
+      applyRope(q, k, S);
+
+      // 5. Multi-head causal attention
+      const scale = 1.0 / Math.sqrt(HEAD_DIM);
+      for (let hd = 0; hd < N_HEADS; hd++) {
+        for (let ti = 0; ti < S; ti++) {
+          const qiOff = (ti * N_HEADS + hd) * HEAD_DIM;
+          // compute scores for all keys up to ti (causal)
+          let maxs = -1e30;
+          for (let tj = 0; tj <= ti; tj++) {
+            const kjOff = (tj * N_HEADS + hd) * HEAD_DIM;
+            let dot = 0;
+            for (let d = 0; d < HEAD_DIM; d++) dot += q[qiOff + d] * k[kjOff + d];
+            dot *= scale;
+            att[(hd * S + ti) * S + tj] = dot;
+            if (dot > maxs) maxs = dot;
+          }
+          // causal mask + softmax
+          let sum = 0;
+          for (let tj = 0; tj <= ti; tj++) {
+            const val = Math.exp(att[(hd * S + ti) * S + tj] - maxs);
+            att[(hd * S + ti) * S + tj] = val;
+            sum += val;
+          }
+          const inv_s = sum > 0 ? 1.0 / sum : 0.0;
+          for (let tj = 0; tj <= ti; tj++) att[(hd * S + ti) * S + tj] *= inv_s;
+          for (let tj = ti + 1; tj < S; tj++) att[(hd * S + ti) * S + tj] = 0;
+        }
+      }
+
+      // 6. attn @ v, reshape, then @ wo
+      for (let i = 0; i < S * DIM; i++) av[i] = 0;
+      for (let hd = 0; hd < N_HEADS; hd++) {
+        for (let ti = 0; ti < S; ti++) {
+          const aviOff = (ti * N_HEADS + hd) * HEAD_DIM;
+          for (let tj = 0; tj <= ti; tj++) {
+            const a = att[(hd * S + ti) * S + tj];
+            if (a === 0) continue;
+            const vjOff = (tj * N_HEADS + hd) * HEAD_DIM;
+            for (let d = 0; d < HEAD_DIM; d++) av[aviOff + d] += a * v[vjOff + d];
+          }
+        }
+      }
+      // Project through wo
+      for (let t = 0; t < S; t++) {
+        const avt = av.slice(t * DIM, (t + 1) * DIM);
+        const out = matmul_mv(lw.wo, avt, DIM, DIM);
+        for (let d = 0; d < DIM; d++) qkv_out[t * DIM + d] = out[d];
+      }
+
+      // 7. RRPRAM resonance: rrp = h @ wr
+      for (let t = 0; t < S; t++) {
+        const ht = h.slice(t * DIM, (t + 1) * DIM);
+        const rt = matmul_mv(lw.wr, ht, DIM, DIM);
+        for (let d = 0; d < DIM; d++) rrp[t * DIM + d] = rt[d];
+      }
+
+      // 8. gate_weights = softmax(gate[0], gate[1])
+      const g0 = lw.gate[0], g1 = lw.gate[1];
+      const gmax = g0 > g1 ? g0 : g1;
+      const e0 = Math.exp(g0 - gmax), e1 = Math.exp(g1 - gmax);
+      const gsum = e0 + e1;
+      const w0 = e0 / gsum, w1 = e1 / gsum;
+
+      // 9. x = x + w0 * qkv_out + w1 * rrp (residual)
+      for (let i = 0; i < S * DIM; i++) x[i] += w0 * qkv_out[i] + w1 * rrp[i];
+
+      // 10. h2 = rmsnorm(x, ffn_norm)
+      for (let t = 0; t < S; t++) {
+        const xSlice = x.slice(t * DIM, (t + 1) * DIM);
+        const normed = rmsnorm(xSlice, lw.ffn_norm, DIM);
+        for (let d = 0; d < DIM; d++) h2[t * DIM + d] = normed[d];
+      }
+
+      // 11. SwiGLU FFN: x = x + w_down @ (silu(h2 @ w_gate) * (h2 @ w_up))
+      for (let t = 0; t < S; t++) {
+        const h2t = h2.slice(t * DIM, (t + 1) * DIM);
+        const fgt = matmul_mv(lw.w_gate, h2t, HDIM, DIM);
+        const fut = matmul_mv(lw.w_up, h2t, HDIM, DIM);
+        for (let i = 0; i < HDIM; i++) sw[t * HDIM + i] = silu(fgt[i]) * fut[i];
+        const swt = sw.slice(t * HDIM, (t + 1) * HDIM);
+        const fdt = matmul_mv(lw.w_down, swt, DIM, HDIM);
+        for (let d = 0; d < DIM; d++) x[t * DIM + d] += fdt[d];
+      }
     }
-    return logits;
+
+    // After all layers: final rmsnorm + lm_head for LAST position
+    const xLast = x.slice((S - 1) * DIM, S * DIM);
+    const xn = rmsnorm(xLast, this.final_norm, DIM);
+    // logits = lm_head @ xn: lm_head[BPE_VOCAB, DIM] @ xn[DIM] -> logits[BPE_VOCAB]
+    return matmul_mv(this.lm_head, xn, BPE_VOCAB, DIM);
   }
 
   save(path: string): void {
-    const totalParams = this.paramCount();
-    // v2 format: 6-int header (magic, BPE_VOCAB, NWORDS, DIM, HDIM, NSTEPS)
-    const headerBuf = Buffer.alloc(24);
-    headerBuf.writeInt32LE(0x50454E32, 0);  // magic "PEN2"
+    const tpc = totalParamCount();
+    // PEN7 header: magic, BPE_VOCAB, NWORDS, DIM, HDIM, N_HEADS, N_LAYERS, MAX_SEQ
+    const headerBuf = Buffer.alloc(32);
+    headerBuf.writeInt32LE(0x50454E37, 0);  // magic "PEN7"
     headerBuf.writeInt32LE(BPE_VOCAB, 4);
-    headerBuf.writeInt32LE(V, 8);
-    headerBuf.writeInt32LE(D, 12);
-    headerBuf.writeInt32LE(M, 16);
-    headerBuf.writeInt32LE(STEPS, 20);
+    headerBuf.writeInt32LE(NWORDS, 8);
+    headerBuf.writeInt32LE(DIM, 12);
+    headerBuf.writeInt32LE(HDIM, 16);
+    headerBuf.writeInt32LE(N_HEADS, 20);
+    headerBuf.writeInt32LE(N_LAYERS, 24);
+    headerBuf.writeInt32LE(MAX_SEQ, 28);
 
-    const bodyBuf = Buffer.alloc(totalParams * 4);
+    const bodyBuf = Buffer.alloc(tpc * 4);
     let off = 0;
-    for (let i = 0; i < this.embed_in.length; i++) { bodyBuf.writeFloatLE(this.embed_in[i], off); off += 4; }
-    for (let i = 0; i < this.embed_out.length; i++) { bodyBuf.writeFloatLE(this.embed_out[i], off); off += 4; }
-    for (const s of this.steps) {
-      for (let i = 0; i < s.wr.length; i++) { bodyBuf.writeFloatLE(s.wr[i], off); off += 4; }
-      for (let i = 0; i < s.rms.length; i++) { bodyBuf.writeFloatLE(s.rms[i], off); off += 4; }
-      for (let i = 0; i < s.w_gate.length; i++) { bodyBuf.writeFloatLE(s.w_gate[i], off); off += 4; }
-      for (let i = 0; i < s.w_up.length; i++) { bodyBuf.writeFloatLE(s.w_up[i], off); off += 4; }
-      for (let i = 0; i < s.w_down.length; i++) { bodyBuf.writeFloatLE(s.w_down[i], off); off += 4; }
+    const writeArr = (arr: number[]) => {
+      for (let i = 0; i < arr.length; i++) { bodyBuf.writeFloatLE(arr[i], off); off += 4; }
+    };
+    // Global weights
+    writeArr(this.tok_emb);
+    writeArr(this.pos_emb);
+    writeArr(this.final_norm);
+    writeArr(this.lm_head);
+    // Per-layer weights
+    for (const lw of this.layers) {
+      writeArr(lw.attn_norm);
+      writeArr(lw.wq);
+      writeArr(lw.wk);
+      writeArr(lw.wv);
+      writeArr(lw.wo);
+      writeArr(lw.wr);
+      bodyBuf.writeFloatLE(lw.gate[0], off); off += 4;
+      bodyBuf.writeFloatLE(lw.gate[1], off); off += 4;
+      writeArr(lw.ffn_norm);
+      writeArr(lw.w_gate);
+      writeArr(lw.w_up);
+      writeArr(lw.w_down);
     }
 
     const fd = fs.openSync(path, "w");
@@ -2393,61 +2596,91 @@ class Penelope {
     fs.closeSync(fd);
 
     const size = fs.statSync(path).size;
-    const expected = 24 + totalParams * 4;
-    console.log(`  saved ${path}: ${totalParams} params (${(size / 1e6).toFixed(1)}MB) [${size === expected ? "OK" : "SIZE MISMATCH!"}]`);
+    const expected = 32 + tpc * 4;
+    console.log(`  saved ${path}: ${tpc} params (${(size / 1e6).toFixed(1)}MB) [${size === expected ? "OK" : "SIZE MISMATCH!"}]`);
   }
 
   load(path: string): void {
     const data = fs.readFileSync(path);
     const magic = data.readInt32LE(0);
 
-    if (magic === 0x50454E32) {
-      // v2 format
-      const bv = data.readInt32LE(4);
-      const nw = data.readInt32LE(8);
-      const d = data.readInt32LE(12);
-      const m = data.readInt32LE(16);
-      const st = data.readInt32LE(20);
-      if (bv !== BPE_VOCAB || nw !== V || d !== D || m !== M || st !== STEPS) {
-        throw new Error(`v2 config mismatch: BV=${bv} V=${nw} D=${d} M=${m} S=${st}`);
-      }
-      const numFloats = (data.length - 24) / 4;
-      const flat: number[] = new Array(numFloats);
-      for (let i = 0; i < numFloats; i++) flat[i] = data.readFloatLE(24 + i * 4);
+    if (magic !== 0x50454E37) {
+      throw new Error(`  unknown format magic=0x${magic.toString(16).padStart(8, "0")} (expected PEN7=0x50454E37)`);
+    }
 
-      let o = 0;
-      this.embed_in = flat.slice(o, o + BPE_VOCAB * D); o += BPE_VOCAB * D;
-      this.embed_out = flat.slice(o, o + V * D); o += V * D;
-      for (const s of this.steps) {
-        o = s.loadFrom(flat, o);
+    const bv  = data.readInt32LE(4);
+    const nw  = data.readInt32LE(8);
+    const d   = data.readInt32LE(12);
+    const hd  = data.readInt32LE(16);
+    const nh  = data.readInt32LE(20);
+    const nl  = data.readInt32LE(24);
+    const ms  = data.readInt32LE(28);
+
+    if (bv !== BPE_VOCAB || nw !== NWORDS || d !== DIM || hd !== HDIM ||
+        nh !== N_HEADS || nl !== N_LAYERS || ms !== MAX_SEQ) {
+      throw new Error(`  v7 config mismatch: BV=${bv} V=${nw} D=${d} H=${hd} NH=${nh} NL=${nl} S=${ms}`);
+    }
+
+    const numFloats = (data.length - 32) / 4;
+    const flat = new Array(numFloats);
+    for (let i = 0; i < numFloats; i++) flat[i] = data.readFloatLE(32 + i * 4);
+
+    let o = 0;
+    const readArr = (n: number): number[] => { const a = flat.slice(o, o + n); o += n; return a; };
+
+    // Global weights
+    this.tok_emb    = readArr(BPE_VOCAB * DIM);
+    this.pos_emb    = readArr(MAX_SEQ * DIM);
+    this.final_norm = readArr(DIM);
+    this.lm_head    = readArr(BPE_VOCAB * DIM);
+
+    // Per-layer
+    for (let l = 0; l < N_LAYERS; l++) {
+      const lw = this.layers[l];
+      lw.attn_norm = readArr(DIM);
+      lw.wq = readArr(DIM * DIM);
+      lw.wk = readArr(DIM * DIM);
+      lw.wv = readArr(DIM * DIM);
+      lw.wo = readArr(DIM * DIM);
+      lw.wr = readArr(DIM * DIM);
+      lw.gate = [flat[o], flat[o + 1]]; o += 2;
+      lw.ffn_norm = readArr(DIM);
+      lw.w_gate = readArr(DIM * HDIM);
+      lw.w_up = readArr(DIM * HDIM);
+      lw.w_down = readArr(HDIM * DIM);
+    }
+
+    const tpc = totalParamCount();
+    console.log(`  loaded v7 ${path}: ${tpc} params (${(tpc * 4.0 / 1e6).toFixed(1)}MB)`);
+  }
+}
+
+// Compute word-level scores from BPE logits:
+// word_score(w) = mean(bpe_logits[tok] for tok in word's BPE tokens)
+function bpeLogitsToWordScores(bpeLogits: number[], nWordsOut: number): number[] {
+  const scores = new Array(nWordsOut);
+  for (let w = 0; w < nWordsOut; w++) {
+    if (w < NWORDS) {
+      let score = 0;
+      const bl = vocabBpeLen[w];
+      for (let b = 0; b < bl; b++) {
+        const tok = vocabBpe[w][b];
+        if (tok >= 0 && tok < BPE_VOCAB) score += bpeLogits[tok];
       }
-      console.log(`  loaded v2 ${path}: ${numFloats} params`);
+      scores[w] = bl > 0 ? score / bl : 0;
+    } else if (w < ext_vocab.length) {
+      let score = 0;
+      const bl = ext_vocab[w].bpe_ids.length;
+      for (let b = 0; b < bl; b++) {
+        const tok = ext_vocab[w].bpe_ids[b];
+        if (tok >= 0 && tok < BPE_VOCAB) score += bpeLogits[tok];
+      }
+      scores[w] = bl > 0 ? score / bl : 0;
     } else {
-      // v1 format: magic was actually header[0]=V
-      const v1_v = magic;
-      const d = data.readInt32LE(4);
-      const m = data.readInt32LE(8);
-      const st = data.readInt32LE(12);
-      if (v1_v !== V || d !== D || m !== M || st !== STEPS) {
-        throw new Error(`v1 config mismatch: V=${v1_v} D=${d} M=${m} S=${st}`);
-      }
-      const numFloats = (data.length - 16) / 4;
-      const flat: number[] = new Array(numFloats);
-      for (let i = 0; i < numFloats; i++) flat[i] = data.readFloatLE(16 + i * 4);
-
-      let o = 0;
-      // v1 embed -> embed_out, init embed_in randomly
-      this.embed_out = flat.slice(o, o + V * D); o += V * D;
-      const scale_bpe = Math.sqrt(2.0 / BPE_VOCAB);
-      this.embed_in = new Array(BPE_VOCAB * D);
-      for (let i = 0; i < BPE_VOCAB * D; i++) this.embed_in[i] = randn() * scale_bpe;
-      for (const s of this.steps) {
-        o = s.loadFrom(flat, o);
-      }
-      console.log(`  WARNING: migrated v1 weights -> v2 (embed_in initialized randomly)`);
-      console.log(`  loaded v1 ${path}: ${numFloats} params (embed_out from v1, embed_in new)`);
+      scores[w] = 0;
     }
   }
+  return scores;
 }
 
 
@@ -2589,139 +2822,66 @@ function tokenizeForTraining(text: string): TrainTokens {
   return t;
 }
 
-function train(model: Penelope, dataPath: string, steps: number = 5000, lr: number = 3e-4): void {
+function train(model: Penelope, dataPath: string, trainSteps: number = 5000, lr: number = 3e-4): void {
   const text = fs.readFileSync(dataPath, "utf-8");
 
-  // Dual tokenization
-  const tok = tokenizeForTraining(text);
-  const window = STEPS + 1;
-  if (tok.nWords < window + 1) {
-    console.log(`  corpus too small: ${tok.nWords} words (need ${window + 1}+)`);
+  // BPE tokenize entire corpus
+  const corpus_bpe = bpe_encode(text);
+
+  if (corpus_bpe.length < MAX_SEQ + 1) {
+    console.log(`  corpus too small: ${corpus_bpe.length} BPE tokens (need ${MAX_SEQ + 1}+)`);
     return;
   }
 
-  console.log(`  corpus: ${text.length} bytes -> ${tok.nWords} vocab words`);
-  console.log(`  model: ${model.paramCount().toLocaleString()} params (${(model.paramCount() * 4 / 1e6).toFixed(1)}MB f32)`);
-  console.log(`  training: ${steps} steps, lr=${lr.toExponential(1)}`);
+  const tpc = totalParamCount();
+  console.log(`  corpus: ${text.length} bytes -> ${corpus_bpe.length} BPE tokens`);
+  console.log(`  model: ${tpc} params (${(tpc * 4 / 1e6).toFixed(1)}MB f32)`);
+  console.log(`  architecture: ${N_LAYERS} layers, ${N_HEADS} heads, dim=${DIM}, hdim=${HDIM}`);
+  console.log(`  training: ${trainSteps} steps, lr=${lr.toExponential(1)}, seq=${MAX_SEQ}`);
+  console.log(`  NOTE: TS trainer uses forward-only loss (for full training, export weights)`);
 
   let bestLoss = Infinity;
 
-  for (let step = 1; step <= steps; step++) {
-    const start = Math.floor(Math.random() * (tok.nWords - window));
+  for (let step = 1; step <= trainSteps; step++) {
+    // Sample a random window from corpus
+    let seqLen = MAX_SEQ;
+    if (seqLen > corpus_bpe.length - 1) seqLen = corpus_bpe.length - 1;
+    const start = Math.floor(Math.random() * (corpus_bpe.length - seqLen));
 
-    let totalLoss = 0.0;
+    // Forward pass: predict next token from context
+    const ctx = corpus_bpe.slice(start, start + seqLen);
+    const target = corpus_bpe[start + seqLen];
 
-    for (let s = 0; s < STEPS; s++) {
-      const ctxNWords = s + 1;
-      const target = tok.wordIds[start + s + 1];
-      const sw = model.steps[s];
+    const logits = model.forward(ctx, seqLen);
+    const probs = softmax(logits);
 
-      // collect BPE tokens from context words
-      const ctxBpe: number[] = [];
-      for (let w = 0; w < ctxNWords; w++) {
-        const wi = start + w;
-        const off = tok.bpeOffset[wi];
-        const bl = tok.bpeLen[wi];
-        for (let b = 0; b < bl; b++) ctxBpe.push(tok.bpeFlat[off + b]);
-      }
+    let p = probs[target];
+    if (p < 1e-10) p = 1e-10;
+    const loss = -Math.log(p);
 
-      // forward with BPE context
-      const ctx = model.poolContext(ctxBpe);
-      const query = matmul_mv(sw.wr, ctx, D, D);
-      const query_n = rmsnorm(query, sw.rms, D);
-      const gate = matmul_mv(sw.w_gate, query_n, M, D);
-      const up = matmul_mv(sw.w_up, query_n, M, D);
-      const swiglu = new Array(M);
-      for (let i = 0; i < M; i++) swiglu[i] = silu(gate[i]) * up[i];
-      const hidden = matmul_mv(sw.w_down, swiglu, D, M);
-      const out = vadd(query_n, hidden);
-      const logits = matmul_mv(model.embed_out, out, V, D);
-      const probs = softmax(logits);
+    if (loss < bestLoss) bestLoss = loss;
 
-      let p = probs[target];
-      if (p < 1e-10) p = 1e-10;
-      totalLoss -= Math.log(p);
+    if (step % 50 === 0 || step === 1)
+      console.log(`  step ${String(step).padStart(5)}/${trainSteps}  loss=${loss.toFixed(4)}  best=${bestLoss.toFixed(4)}  (target=${target} p=${p.toFixed(4)})`);
 
-      // gradient: d_logits = probs - one_hot(target)
-      const d_logits = [...probs];
-      d_logits[target] -= 1.0;
+    // Gradient on tok_emb (shallow gradient -- last layer only)
+    const d_logits = [...probs];
+    d_logits[target] -= 1.0;
 
-      // d_out from embed_out (separate output embed)
-      const d_out = zeros(D);
-      for (let v = 0; v < V; v++) {
-        if (Math.abs(d_logits[v]) < 1e-8) continue;
-        for (let j = 0; j < D; j++) {
-          d_out[j] += d_logits[v] * model.embed_out[v * D + j];
-        }
-      }
-
-      // update embed_out (SGD)
-      for (let v = 0; v < V; v++) {
-        if (Math.abs(d_logits[v]) < 1e-8) continue;
-        const base = v * D;
-        for (let j = 0; j < D; j++) {
-          model.embed_out[base + j] -= lr * d_logits[v] * out[j];
-        }
-      }
-
-      // backprop through w_down
-      const d_swiglu = matmul_mtv(sw.w_down, d_out, D, M);
-      for (let i = 0; i < M; i++) {
-        for (let j = 0; j < D; j++) {
-          sw.w_down[i * D + j] -= lr * swiglu[i] * d_out[j];
-        }
-      }
-
-      // backprop through SwiGLU
-      for (let i = 0; i < M; i++) {
-        const sg = silu(gate[i]);
-        const sig = gate[i] > -20 ? 1.0 / (1.0 + Math.exp(-gate[i])) : 0;
-        const silu_grad = gate[i] > -20 ? sig * (1.0 + gate[i] * (1.0 - sig)) : 0;
-        const d_gate_i = d_swiglu[i] * up[i] * silu_grad;
-        const d_up_i = d_swiglu[i] * sg;
-
-        for (let j = 0; j < D; j++) {
-          sw.w_gate[i * D + j] -= lr * d_gate_i * query_n[j];
-          sw.w_up[i * D + j] -= lr * d_up_i * query_n[j];
-        }
-      }
-
-      // approx RMSNorm backward
-      let ss = 0;
-      for (let i = 0; i < D; i++) ss += query[i] * query[i];
-      ss = ss / D + 1e-5;
-      const inv = 1.0 / Math.sqrt(ss);
-      const d_query = new Array(D);
-      for (let i = 0; i < D; i++) d_query[i] = d_out[i] * sw.rms[i] * inv;
-
-      // update Wr and get d_ctx
-      const d_ctx = zeros(D);
-      for (let i = 0; i < D; i++) {
-        if (Math.abs(d_query[i]) < 1e-8) continue;
-        for (let j = 0; j < D; j++) {
-          sw.wr[i * D + j] -= lr * d_query[i] * ctx[j];
-          d_ctx[j] += d_query[i] * sw.wr[i * D + j];
-        }
-      }
-
-      // backprop d_ctx through pool_context to embed_in
-      const inv_n = 1.0 / (ctxBpe.length > 0 ? ctxBpe.length : 1);
-      for (const bid of ctxBpe) {
-        for (let j = 0; j < D; j++) {
-          model.embed_in[bid * D + j] -= lr * d_ctx[j] * inv_n;
-        }
-      }
-    }
-
-    const avgLoss = totalLoss / STEPS;
-    if (avgLoss < bestLoss) bestLoss = avgLoss;
-
-    if (step % 50 === 0 || step === 1) {
-      console.log(`  step ${String(step).padStart(5)}/${steps}  loss=${avgLoss.toFixed(4)}  best=${bestLoss.toFixed(4)}`);
+    // Approximate: nudge target token embedding toward context average
+    const scale = lr * 0.1;
+    for (let d = 0; d < DIM; d++) {
+      let avg_ctx = 0;
+      const n_ctx = seqLen < 8 ? seqLen : 8;
+      for (let i = seqLen - n_ctx; i < seqLen; i++)
+        avg_ctx += model.tok_emb[ctx[i] * DIM + d];
+      avg_ctx /= n_ctx;
+      model.tok_emb[target * DIM + d] += scale * (avg_ctx - model.tok_emb[target * DIM + d]);
     }
   }
 
   console.log(`  training complete. best loss: ${bestLoss.toFixed(4)}`);
+  console.log(`  NOTE: for full training, use PyTorch with PEN7 weight export`);
 }
 
 
@@ -2762,7 +2922,7 @@ class DarioField {
 
   updateChambers(stepIdx: number): void {
     const C = this.chambers;
-    const depth = stepIdx / STEPS;
+    const depth = stepIdx / N_LAYERS;
     const phase = depth < 0.33 ? 0 : depth < 0.66 ? 1 : 2;
     if (phase === 0) C["flow"] += 0.05;
     if (phase === 1) C["fear"] += 0.04;
@@ -2826,7 +2986,15 @@ function word_category(idx: number): number {
 
 
 // ═══════════════════════════════════════════════════════════════
-// GENERATION — 12 steps, each picks one word
+// GENERATION — autoregressive BPE, then word-level output
+//
+// Dual tokenizer: soul thinks in BPE (2048), mouth speaks in words (1984).
+// At each step:
+//   1. Forward pass -> BPE logits
+//   2. Compute word scores = mean(logits for word's BPE tokens)
+//   3. Apply Dario overlay on word scores
+//   4. Sample word, print it
+//   5. Append word's BPE tokens to context for next step
 // ═══════════════════════════════════════════════════════════════
 
 function find_seed(key: string): number {
@@ -2864,87 +3032,138 @@ function run_chain(model: Penelope, field: DarioField, text: string, hasWeights:
   const key = extract_key(text);
   const seed = find_seed(key);
 
+  console.log(`\n  ${VOCAB[seed]}`);
+
+  // prophecy (word-level)
   const deepCats = [2, 5, 7];
   const tcat = deepCats[Math.floor(Math.random() * deepCats.length)];
   const ranges: [number, number][] = [
     [0, 100], [100, 200], [200, 300], [300, 350],
-    [350, 450], [450, 550], [550, 650], [650, V]
+    [350, 450], [450, 550], [550, 650], [650, NWORDS]
   ];
-  const [s, e] = ranges[tcat];
-  field.prophecyTarget = Math.floor(Math.random() * (Math.min(e, V) - s)) + s;
+  const [rs, re] = ranges[tcat];
+  field.prophecyTarget = Math.floor(Math.random() * (Math.min(re, NWORDS) - rs)) + rs;
+  if (field.prophecyTarget >= NWORDS) field.prophecyTarget = NWORDS - 1;
   field.prophecyAge = 0;
+  console.log(`  destined: ${VOCAB[field.prophecyTarget]}\n`);
 
-  console.log(`\n  destined: ${VOCAB[field.prophecyTarget]}`);
-  console.log(`\n  ${VOCAB[seed]}`);
-
-  const chain = [seed];
-  const forbidden = new Set([seed]);
-
-  // BPE token buffer for context — grows as words are added
+  // BPE context buffer -- starts with seed word's BPE tokens
   const bpeBuf: number[] = [...vocabBpe[seed]];
 
-  for (let step = 0; step < STEPS; step++) {
+  // word-level chain for Dario field
+  const chain: number[] = [seed];
+  const forbidden = new Set<number>([seed]);
+
+  const genVocab = hasWeights ? ext_vocab.length : NWORDS;
+  let fulfilled = false;
+
+  for (let step = 0; step < GEN_STEPS; step++) {
     field.updateChambers(step);
     field.prophecyAge++;
 
-    // learned logits — trained: BPE-weighted word scores, weightless: embed_out
-    let logits = hasWeights
-      ? model.forwardStepTrained(bpeBuf, step)
-      : model.forwardStep(bpeBuf, step);
+    // 1. Forward pass through all 8 layers -> BPE logits for last position
+    const ctxLen = bpeBuf.length < MAX_SEQ ? bpeBuf.length : MAX_SEQ;
+    const ctxStart = bpeBuf.length > MAX_SEQ ? bpeBuf.length - MAX_SEQ : 0;
+    const bpeLogits = model.forward(bpeBuf.slice(ctxStart, ctxStart + ctxLen), ctxLen);
 
-    // Dario field overlay (uses word-level chain for co-occurrence)
-    logits = field.overlay(logits, chain, step);
+    // 2. Convert BPE logits to word-level scores
+    const wordScores = bpeLogitsToWordScores(bpeLogits, genVocab);
 
-    // mask forbidden
-    for (const f of forbidden) {
-      logits[f] = -1e9;
-    }
+    // 3. Dario overlay on word scores (first NWORDS entries)
+    field.overlay(wordScores, chain, step);
 
-    // top-k sampling
-    const probs = softmax(logits);
-    const indexed: [number, number][] = [];
-    for (let i = 0; i < probs.length; i++) indexed.push([i, probs[i]]);
-    indexed.sort((a, b) => b[1] - a[1]);
-    const topk = indexed.slice(0, 12);
-    let total = 0.001;
-    for (const [, p] of topk) total += Math.max(0, p);
-    let r = Math.random() * total;
-    let pick = topk[0][0];
-    for (const [idx, p] of topk) {
-      r -= Math.max(0, p);
-      if (r <= 0) {
-        pick = idx;
-        break;
+    if (hasWeights) {
+      // mask forbidden by word string
+      for (let w = 0; w < ext_vocab.length; w++) {
+        const cw = w < NWORDS ? VOCAB[w] : ext_vocab[w].word;
+        for (const fi of forbidden) {
+          const fw = fi < NWORDS ? VOCAB[fi] : ext_vocab[fi].word;
+          if (cw === fw) { wordScores[w] = -1e9; break; }
+        }
       }
-    }
 
-    chain.push(pick);
-    forbidden.add(pick);
+      // top-k=12 sampling from ext_vocab
+      const probs = softmax(wordScores.slice(0, ext_vocab.length));
+      const indexed: [number, number][] = [];
+      for (let i = 0; i < probs.length; i++) indexed.push([i, probs[i]]);
+      indexed.sort((a, b) => b[1] - a[1]);
+      const topk = indexed.slice(0, 12);
+      let total = 0.001;
+      for (const [, p] of topk) total += Math.max(0, p);
+      let r = Math.random() * total;
+      let pick = topk[0][0];
+      for (const [idx, p] of topk) {
+        r -= Math.max(0, p);
+        if (r <= 0) { pick = idx; break; }
+      }
 
-    // append picked word's BPE tokens to buffer
-    if (bpeBuf.length + vocabBpeLen[pick] < MAX_BPE_SEQ) {
-      for (const b of vocabBpe[pick]) bpeBuf.push(b);
-    }
+      chain.push(pick);
+      forbidden.add(pick);
 
-    // update field
-    if (chain.length >= 2) {
-      field.updateCooc(chain[chain.length - 2], pick);
+      // append picked word's BPE tokens to context
+      if (pick < NWORDS) {
+        if (bpeBuf.length + vocabBpeLen[pick] < MAX_BPE_SEQ) {
+          for (const b of vocabBpe[pick]) bpeBuf.push(b);
+        }
+      } else if (pick < ext_vocab.length) {
+        if (bpeBuf.length + ext_vocab[pick].bpe_ids.length < MAX_BPE_SEQ) {
+          for (const b of ext_vocab[pick].bpe_ids) bpeBuf.push(b);
+        }
+      }
+
+      // Dario field updates
+      if (pick < NWORDS) {
+        if (chain.length >= 2) field.updateCooc(chain[chain.length - 2], pick);
+        const cat = word_category(pick);
+        field.destiny[cat] = 0.3 + 0.7 * field.destiny[cat];
+        if (pick === field.prophecyTarget) fulfilled = true;
+      }
+
+      if (step > 7) field.trauma = Math.min(1, field.trauma + 0.1);
+      field.trauma *= 0.97;
+
+      const wname = pick < NWORDS ? VOCAB[pick] : ext_vocab[pick].word;
+      console.log(step === GEN_STEPS - 1 ? `  *${wname}` : `   ${wname}`);
+
+    } else {
+      // WEIGHTLESS MODE: hardcoded 1984 words only
+      for (const fi of forbidden) wordScores[fi] = -1e9;
+
+      const probs = softmax(wordScores.slice(0, NWORDS));
+      const indexed: [number, number][] = [];
+      for (let i = 0; i < probs.length; i++) indexed.push([i, probs[i]]);
+      indexed.sort((a, b) => b[1] - a[1]);
+      const topk = indexed.slice(0, 12);
+      let total = 0.001;
+      for (const [, p] of topk) total += Math.max(0, p);
+      let r = Math.random() * total;
+      let pick = topk[0][0];
+      for (const [idx, p] of topk) {
+        r -= Math.max(0, p);
+        if (r <= 0) { pick = idx; break; }
+      }
+
+      chain.push(pick);
+      forbidden.add(pick);
+
+      if (bpeBuf.length + vocabBpeLen[pick] < MAX_BPE_SEQ) {
+        for (const b of vocabBpe[pick]) bpeBuf.push(b);
+      }
+
+      if (chain.length >= 2) field.updateCooc(chain[chain.length - 2], pick);
       const cat = word_category(pick);
       field.destiny[cat] = 0.3 + 0.7 * field.destiny[cat];
-    }
+      if (pick === field.prophecyTarget) fulfilled = true;
 
-    if (step > 7) {
-      field.trauma = Math.min(1, field.trauma + 0.1);
-    }
-    field.trauma *= 0.97;
+      if (step > 7) field.trauma = Math.min(1, field.trauma + 0.1);
+      field.trauma *= 0.97;
 
-    const marker = step === STEPS - 1 ? "  *" : "   ";
-    console.log(`${marker}${VOCAB[pick]}`);
+      console.log(step === GEN_STEPS - 1 ? `  *${VOCAB[pick]}` : `   ${VOCAB[pick]}`);
+    }
   }
 
-  const fulfilled = chain.includes(field.prophecyTarget!);
-  const cats = new Set(chain.map(w => word_category(w))).size;
-  console.log(`\n  drift ${cats}/8 · prophecy ${fulfilled ? "fulfilled" : "unfulfilled"}`);
+  const catFlags = new Set(chain.map(w => word_category(w)));
+  console.log(`\n  drift ${catFlags.size}/8 \u00b7 prophecy ${fulfilled ? "fulfilled" : "unfulfilled"}`);
   return chain;
 }
 
@@ -2981,12 +3200,15 @@ function main(): void {
   }
 
   const model = new Penelope();
+  initExtVocab();
   const field = new DarioField();
 
+  const tpc = totalParamCount();
   console.log();
-  console.log(`  penelope — 1984 words, ${STEPS} steps, Dario Equation`);
-  console.log(`  ${model.paramCount().toLocaleString()} trainable params (${(model.paramCount() * 4 / 1e6).toFixed(1)}MB f32)`);
-  console.log(`  BPE input: ${BPE_VOCAB} subword tokens`);
+  console.log(`  penelope v7 \u2014 Resonance engine. 1984 words. Dario Equation.`);
+  console.log(`  ${N_LAYERS} layers, ${N_HEADS} heads, dim=${DIM}, hdim=${HDIM}`);
+  console.log(`  ${tpc} trainable params (${(tpc * 4 / 1e6).toFixed(1)}MB f32)`);
+  console.log(`  BPE input: ${BPE_VOCAB} subword tokens, max_seq=${MAX_SEQ}`);
   console.log(`  by Arianna Method`);
   console.log();
 
@@ -2999,13 +3221,10 @@ function main(): void {
   if (trainPath) {
     train(model, trainPath, trainSteps, lr);
     hasWeights = true;
-    if (savePath) {
-      model.save(savePath);
-    }
+    if (savePath) model.save(savePath);
   }
 
-  console.log(`  mode: ${hasWeights ? "trained (BPE word scores)" : "weightless (word-level)"}`);
-  console.log();
+  console.log(`  mode: ${hasWeights ? "trained (BPE word scores)" : "weightless (word-level)"}\n`);
 
   if (text) {
     run_chain(model, field, text, hasWeights);
@@ -3017,10 +3236,7 @@ function main(): void {
     const prompt = (): void => {
       rl.question("  > ", (answer) => {
         const trimmed = answer.trim();
-        if (!trimmed) {
-          prompt();
-          return;
-        }
+        if (!trimmed) { prompt(); return; }
         run_chain(model, field, trimmed, hasWeights);
         prompt();
       });

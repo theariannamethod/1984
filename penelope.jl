@@ -1,26 +1,24 @@
-# penelope.jl — 1984 words. 12 steps of resonance. Dario Equation.
+# penelope.jl — v7 Resonance engine. 1984 words. Dario Equation.
 # Julia version. Single file. No dependencies.
 #
-# Trainable resonance engine. Not a transformer. A mirror that learns.
+# 8-layer sequential transformer with multi-head attention, RoPE,
+# RRPRAM resonance gates, and SwiGLU FFN. Dual tokenizer:
+# BPE input (2048 subwords), word-level output (1984 words).
 #
-# Input:  text → BPE subword tokens (2048-token byte-pair encoding)
-# Attend: RRPRAM resonance + SwiGLU per step (how it thinks)
-# Output: word-level from 1984 vocab (gibberish impossible)
+# Architecture per layer l:
+#     h = rmsnorm(x, attn_norm_l)
+#     qkv_out = MultiHeadAttention(h; wq_l, wk_l, wv_l, wo_l, RoPE)
+#     rrp = h @ wr_l                            RRPRAM resonance
+#     gate = softmax(gate_l[0], gate_l[1])
+#     x = x + gate[0]*qkv_out + gate[1]*rrp    gated residual
+#     h2 = rmsnorm(x, ffn_norm_l)
+#     x = x + SwiGLU(h2; w_gate_l, w_up_l, w_down_l)  residual
 #
-# 12 learned step-weights (~1.03M each). Each step has its own lens.
-# Step 1 sees the surface. Step 12 sees the bone.
+# After 8 layers:
+#     logits = rmsnorm(x, final_norm) @ lm_head^T
+#     word_score(w) = mean(logits[bpe_tokens(w)]) + DarioField
 #
-# Architecture per step s:
-#     context = pool(embed_in(BPE tokens))
-#     query   = RMSNorm(context @ Wr_s)          RRPRAM resonance
-#     hidden  = SwiGLU(query; gate_s, up_s, down_s)
-#     logits  = (query + hidden) @ E_out^T        separate output embed
-#     logits += DarioField(context)               live overlay
-#     word    = sample(softmax(logits))
-#
-# Total: ~14M params (786K embed_in + 762K embed_out + 12 × 1.03M steps)
-#
-#   score(w) = B + α·H + β·F + γ·A + T      (Dario Equation)
+#   score(w) = B + alpha*H + beta*F + gamma*A + T   (Dario Equation)
 #
 # By Arianna Method. הרזוננס לא נשבר
 
@@ -263,14 +261,20 @@ const VOCAB = [
 
 
 const V = length(VOCAB)  # 1990 (1984 canonical + 6 overlapping entries)
-const STEPS = 12
-const D = 384            # embedding dim
-const M = 768            # SwiGLU hidden dim
+const DIM       = 448
+const HDIM      = 896       # DIM * 2, SwiGLU hidden
+const N_HEADS   = 7
+const HEAD_DIM  = 64        # DIM / N_HEADS
+const N_LAYERS  = 8         # sequential transformer layers
+const MAX_SEQ   = 256
+const NWORDS    = 1984
 
 const BPE_VOCAB  = 2048
 const BPE_MERGES = 1792
 
 const MAX_BPE_SEQ = 16384
+const MAX_EXT_VOCAB = 4096
+const GEN_STEPS = 12
 
 # BPE merge table — 1792 merges, learned from 2301588 bytes of English text
 # Each row is (left, right) pair. Merge i produces token 256+i.
@@ -2208,242 +2212,368 @@ end
 
 
 # ═══════════════════════════════════════════════════════════════
-# MODEL — 12 step-specific weight sets + shared embedding
+# MODEL — v7 Resonance: 8 sequential layers with
+# multi-head attention + RoPE + RRPRAM resonance gate + SwiGLU
 # ═══════════════════════════════════════════════════════════════
 
-mutable struct StepWeights
-    wr::Vector{Float64}       # D*D
-    rms::Vector{Float64}      # D
-    w_gate::Vector{Float64}   # D*M
-    w_up::Vector{Float64}     # D*M
-    w_down::Vector{Float64}   # M*D
+mutable struct LayerWeights
+    attn_norm::Vector{Float64}   # [DIM]         pre-attention RMSNorm
+    wq::Vector{Float64}          # [DIM * DIM]   query projection
+    wk::Vector{Float64}          # [DIM * DIM]   key projection
+    wv::Vector{Float64}          # [DIM * DIM]   value projection
+    wo::Vector{Float64}          # [DIM * DIM]   output projection
+    wr::Vector{Float64}          # [DIM * DIM]   RRPRAM resonance
+    gate::Vector{Float64}        # [2]           blend QKV + RRPRAM
+    ffn_norm::Vector{Float64}    # [DIM]         pre-FFN RMSNorm
+    w_gate::Vector{Float64}      # [DIM * HDIM]  SwiGLU gate (note: HDIM > DIM)
+    w_up::Vector{Float64}        # [DIM * HDIM]  SwiGLU up
+    w_down::Vector{Float64}      # [HDIM * DIM]  SwiGLU down
 end
 
-function StepWeights()
-    scale_d = sqrt(2.0 / D)
-    scale_m = sqrt(2.0 / M)
-    wr     = [_randn() * scale_d for _ in 1:(D * D)]
-    rms    = ones(Float64, D)
-    w_gate = [_randn() * scale_d for _ in 1:(D * M)]
-    w_up   = [_randn() * scale_d for _ in 1:(D * M)]
-    w_down = [_randn() * scale_m for _ in 1:(M * D)]
-    return StepWeights(wr, rms, w_gate, w_up, w_down)
+function LayerWeights()
+    scale_d = sqrt(2.0 / DIM)
+    scale_h = sqrt(2.0 / HDIM)
+    attn_norm = ones(Float64, DIM)
+    wq = [_randn() * scale_d for _ in 1:(DIM * DIM)]
+    wk = [_randn() * scale_d for _ in 1:(DIM * DIM)]
+    wv = [_randn() * scale_d for _ in 1:(DIM * DIM)]
+    wo = [_randn() * scale_d for _ in 1:(DIM * DIM)]
+    wr = [_randn() * scale_d for _ in 1:(DIM * DIM)]
+    gate = [0.0, 0.0]  # 50/50 blend
+    ffn_norm = ones(Float64, DIM)
+    w_gate = [_randn() * scale_d for _ in 1:(DIM * HDIM)]
+    w_up   = [_randn() * scale_d for _ in 1:(DIM * HDIM)]
+    w_down = [_randn() * scale_h for _ in 1:(HDIM * DIM)]
+    return LayerWeights(attn_norm, wq, wk, wv, wo, wr, gate, ffn_norm, w_gate, w_up, w_down)
 end
 
-function step_param_count()
-    return D*D + D + D*M + D*M + M*D
+function layer_param_count()
+    # attn_norm + wq + wk + wv + wo + wr + gate + ffn_norm + w_gate + w_up + w_down
+    return DIM + DIM*DIM*5 + 2 + DIM + DIM*HDIM*2 + HDIM*DIM
 end
 
 mutable struct Penelope
-    embed_in::Vector{Float64}   # BPE_VOCAB*D — input BPE embedding
-    embed_out::Vector{Float64}  # V*D — output word embedding
-    steps::Vector{StepWeights}
+    # Global weights
+    tok_emb::Vector{Float64}     # [BPE_VOCAB * DIM]  token embedding
+    pos_emb::Vector{Float64}     # [MAX_SEQ * DIM]    positional embedding
+    final_norm::Vector{Float64}  # [DIM]              final RMSNorm
+    lm_head::Vector{Float64}     # [BPE_VOCAB * DIM]  language model head
+    # Per-layer
+    layers::Vector{LayerWeights}
 end
 
 function Penelope()
+    scale_d = sqrt(2.0 / DIM)
     scale_bpe = sqrt(2.0 / BPE_VOCAB)
-    scale_v = sqrt(2.0 / V)
-    embed_in  = [_randn() * scale_bpe for _ in 1:(BPE_VOCAB * D)]
-    embed_out = [_randn() * scale_v   for _ in 1:(V * D)]
-    steps = [StepWeights() for _ in 1:STEPS]
-    return Penelope(embed_in, embed_out, steps)
+    tok_emb    = [_randn() * scale_bpe for _ in 1:(BPE_VOCAB * DIM)]
+    pos_emb    = [_randn() * 0.02      for _ in 1:(MAX_SEQ * DIM)]
+    final_norm = ones(Float64, DIM)
+    lm_head    = [_randn() * scale_d   for _ in 1:(BPE_VOCAB * DIM)]
+    layers = [LayerWeights() for _ in 1:N_LAYERS]
+    return Penelope(tok_emb, pos_emb, final_norm, lm_head, layers)
 end
 
-function param_count(model::Penelope)
-    return BPE_VOCAB * D + V * D + STEPS * step_param_count()
+function param_count(::Penelope)
+    global_params = BPE_VOCAB * DIM + MAX_SEQ * DIM + DIM + BPE_VOCAB * DIM
+    return global_params + N_LAYERS * layer_param_count()
 end
 
-function get_embed_in(model::Penelope, idx::Int)
-    # idx is 0-based BPE token ID
-    base = idx * D + 1  # convert to 1-based Julia indexing
-    return model.embed_in[base:base + D - 1]
+
+# ═══════════════════════════════════════════════════════════════
+# EXTENDED VOCAB — hardcoded 1984 + BPE tokens that are whole words
+# Built at init from BPE decode. Word-level always, gibberish impossible.
+# ═══════════════════════════════════════════════════════════════
+
+struct ExtWord
+    word::String
+    bpe_ids::Vector{Int}
+    from_hardcoded::Bool
 end
 
-function get_embed_out(model::Penelope, idx::Int)
-    # idx is 0-based word ID
-    base = idx * D + 1
-    return model.embed_out[base:base + D - 1]
-end
-
-function pool_context(model::Penelope, bpe_ids::Vector{Int})
-    # bpe_ids are 0-based BPE token IDs — uses embed_in
-    if isempty(bpe_ids)
-        return _zeros(D)
+# BPE decode table — maps token ID to string
+function build_bpe_strs()
+    strs = Vector{String}(undef, BPE_VOCAB)
+    for i in 0:255
+        strs[i + 1] = String([UInt8(i)])
     end
-    ctx = _zeros(D)
-    for bid in bpe_ids
-        e = get_embed_in(model, bid)
-        ctx = vadd(ctx, e)
+    for m in 1:BPE_MERGES
+        left, right = BPE_TABLE[m]
+        id = 256 + m - 1
+        if id + 1 <= BPE_VOCAB
+            strs[id + 1] = strs[left + 1] * strs[right + 1]
+        end
     end
-    return vscale(ctx, 1.0 / length(bpe_ids))
+    return strs
 end
 
-function forward_step(model::Penelope, bpe_ids::Vector{Int}, step_idx::Int)
-    # step_idx is 0-based, bpe_ids are 0-based BPE token IDs
-    sw = model.steps[step_idx + 1]  # Julia 1-based
-    ctx = pool_context(model, bpe_ids)
+const BPE_STRS = build_bpe_strs()
 
-    # RRPRAM resonance: query = ctx @ Wr
-    query = matmul_mv(sw.wr, ctx, D, D)
+function is_alpha_word(s::String)
+    length(s) < 2 && return false
+    for c in s
+        isletter(c) || return false
+    end
+    return true
+end
 
-    # RMSNorm
-    query = rmsnorm(query, sw.rms, D)
+function init_ext_vocab()
+    ext = ExtWord[]
 
-    # SwiGLU
-    gate = matmul_mv(sw.w_gate, query, M, D)
-    up = matmul_mv(sw.w_up, query, M, D)
-    swiglu = [_silu(gate[i]) * up[i] for i in 1:M]
-    hidden = matmul_mv(sw.w_down, swiglu, D, M)
+    # 1. Add all hardcoded words (first NWORDS from VOCAB)
+    for i in 1:min(NWORDS, V)
+        push!(ext, ExtWord(VOCAB[i], VOCAB_BPE[i], true))
+    end
 
-    # Residual
-    out = vadd(query, hidden)
+    # 2. Add BPE tokens that decode to whole words (not already in vocab)
+    existing = Set(ew.word for ew in ext)
+    for t in 0:(BPE_VOCAB - 1)
+        s = BPE_STRS[t + 1]
+        is_alpha_word(s) || continue
+        low = lowercase(s)
+        low in existing && continue
+        length(ext) >= MAX_EXT_VOCAB && break
+        push!(ext, ExtWord(low, [t], false))
+        push!(existing, low)
+    end
 
-    # Logits = E_out @ out (separate output embed)
-    logits = matmul_mv(model.embed_out, out, V, D)
+    return ext
+end
+
+const EXT_VOCAB = init_ext_vocab()
+
+function ext_vocab_find(word::String)
+    for (i, ew) in enumerate(EXT_VOCAB)
+        ew.word == word && return i
+    end
+    return nothing
+end
+
+
+# ═══════════════════════════════════════════════════════════════
+# RoPE — rotary position embedding
+# ═══════════════════════════════════════════════════════════════
+
+function apply_rope!(q::Vector{Float64}, k::Vector{Float64}, seq_len::Int)
+    theta_base = 10000.0
+    for t in 0:(seq_len - 1)
+        for h in 0:(N_HEADS - 1)
+            offset = (t * N_HEADS + h) * HEAD_DIM
+            for d in 0:(HEAD_DIM >> 1 - 1)
+                freq = 1.0 / theta_base^(2.0 * d / HEAD_DIM)
+                cos_f = cos(t * freq)
+                sin_f = sin(t * freq)
+                # rotate q
+                qi0 = offset + d + 1
+                qi1 = offset + d + HEAD_DIM >> 1 + 1
+                q0, q1 = q[qi0], q[qi1]
+                q[qi0] = q0 * cos_f - q1 * sin_f
+                q[qi1] = q0 * sin_f + q1 * cos_f
+                # rotate k
+                k0, k1 = k[qi0], k[qi1]
+                k[qi0] = k0 * cos_f - k1 * sin_f
+                k[qi1] = k0 * sin_f + k1 * cos_f
+            end
+        end
+    end
+end
+
+
+# ═══════════════════════════════════════════════════════════════
+# FORWARD — v7 Resonance: 8 sequential layers, multi-head
+# attention + RoPE + RRPRAM gate + SwiGLU, then BPE logits
+# ═══════════════════════════════════════════════════════════════
+
+function forward(model::Penelope, bpe_ids::Vector{Int}, seq_len::Int)
+    S = clamp(seq_len, 1, MAX_SEQ)
+
+    # x: [S * DIM] — residual stream
+    x = zeros(Float64, S * DIM)
+
+    # embed: tok_emb + pos_emb
+    for t in 0:(S - 1)
+        tok = bpe_ids[t + 1]
+        if tok < 0 || tok >= BPE_VOCAB; tok = 0; end
+        for d in 1:DIM
+            x[t * DIM + d] = model.tok_emb[tok * DIM + d] + model.pos_emb[t * DIM + d]
+        end
+    end
+
+    # scratch buffers
+    h   = zeros(Float64, S * DIM)
+    q   = zeros(Float64, S * DIM)
+    k   = zeros(Float64, S * DIM)
+    v   = zeros(Float64, S * DIM)
+    att = zeros(Float64, S * S * N_HEADS)
+    av  = zeros(Float64, S * DIM)
+    qkv_out = zeros(Float64, S * DIM)
+    rrp = zeros(Float64, S * DIM)
+    h2  = zeros(Float64, S * DIM)
+    fg  = zeros(Float64, S * HDIM)
+    fu  = zeros(Float64, S * HDIM)
+    sw  = zeros(Float64, S * HDIM)
+    fd  = zeros(Float64, S * DIM)
+
+    for l in 1:N_LAYERS
+        lw = model.layers[l]
+
+        # 1. h = rmsnorm(x, attn_norm) for each position
+        for t in 0:(S - 1)
+            xslice = x[(t * DIM + 1):((t + 1) * DIM)]
+            normed = rmsnorm(xslice, lw.attn_norm, DIM)
+            h[(t * DIM + 1):((t + 1) * DIM)] .= normed
+        end
+
+        # 2-3. q = h @ wq, k = h @ wk, v = h @ wv (per position)
+        for t in 0:(S - 1)
+            hs = h[(t * DIM + 1):((t + 1) * DIM)]
+            q[(t * DIM + 1):((t + 1) * DIM)] .= matmul_mv(lw.wq, hs, DIM, DIM)
+            k[(t * DIM + 1):((t + 1) * DIM)] .= matmul_mv(lw.wk, hs, DIM, DIM)
+            v[(t * DIM + 1):((t + 1) * DIM)] .= matmul_mv(lw.wv, hs, DIM, DIM)
+        end
+
+        # Apply RoPE to q and k
+        apply_rope!(q, k, S)
+
+        # 5. Multi-head causal attention: softmax(q @ k^T / sqrt(head_dim))
+        scale = 1.0 / sqrt(Float64(HEAD_DIM))
+        for hd in 0:(N_HEADS - 1)
+            for ti in 0:(S - 1)
+                qi_off = (ti * N_HEADS + hd) * HEAD_DIM
+                maxs = -1e30
+                for tj in 0:ti
+                    kj_off = (tj * N_HEADS + hd) * HEAD_DIM
+                    dot = 0.0
+                    @inbounds for d in 1:HEAD_DIM
+                        dot += q[qi_off + d] * k[kj_off + d]
+                    end
+                    dot *= scale
+                    att[(hd * S + ti) * S + tj + 1] = dot
+                    if dot > maxs; maxs = dot; end
+                end
+                # causal mask + softmax
+                s_sum = 0.0
+                for tj in 0:ti
+                    idx = (hd * S + ti) * S + tj + 1
+                    val = exp(att[idx] - maxs)
+                    att[idx] = val
+                    s_sum += val
+                end
+                inv_s = s_sum > 0.0 ? 1.0 / s_sum : 0.0
+                for tj in 0:ti
+                    att[(hd * S + ti) * S + tj + 1] *= inv_s
+                end
+                # zero future
+                for tj in (ti + 1):(S - 1)
+                    att[(hd * S + ti) * S + tj + 1] = 0.0
+                end
+            end
+        end
+
+        # 6. attn @ v, reshape, then @ wo
+        fill!(av, 0.0)
+        for hd in 0:(N_HEADS - 1)
+            for ti in 0:(S - 1)
+                avi_off = (ti * N_HEADS + hd) * HEAD_DIM
+                for tj in 0:ti
+                    a = att[(hd * S + ti) * S + tj + 1]
+                    a == 0.0 && continue
+                    vj_off = (tj * N_HEADS + hd) * HEAD_DIM
+                    @inbounds for d in 1:HEAD_DIM
+                        av[avi_off + d] += a * v[vj_off + d]
+                    end
+                end
+            end
+        end
+        # av is [S, DIM] (concatenated heads). Project through wo
+        for t in 0:(S - 1)
+            av_slice = av[(t * DIM + 1):((t + 1) * DIM)]
+            qkv_out[(t * DIM + 1):((t + 1) * DIM)] .= matmul_mv(lw.wo, av_slice, DIM, DIM)
+        end
+
+        # 7. RRPRAM resonance: rrp = h @ wr
+        for t in 0:(S - 1)
+            hs = h[(t * DIM + 1):((t + 1) * DIM)]
+            rrp[(t * DIM + 1):((t + 1) * DIM)] .= matmul_mv(lw.wr, hs, DIM, DIM)
+        end
+
+        # 8. gate_weights = softmax(gate[0], gate[1])
+        g0, g1 = lw.gate[1], lw.gate[2]
+        gmax = max(g0, g1)
+        e0, e1 = exp(g0 - gmax), exp(g1 - gmax)
+        gsum = e0 + e1
+        w0, w1 = e0 / gsum, e1 / gsum
+
+        # 9. x = x + w0 * qkv_out + w1 * rrp (residual)
+        @inbounds for i in 1:(S * DIM)
+            x[i] += w0 * qkv_out[i] + w1 * rrp[i]
+        end
+
+        # 10. h2 = rmsnorm(x, ffn_norm)
+        for t in 0:(S - 1)
+            xslice = x[(t * DIM + 1):((t + 1) * DIM)]
+            normed = rmsnorm(xslice, lw.ffn_norm, DIM)
+            h2[(t * DIM + 1):((t + 1) * DIM)] .= normed
+        end
+
+        # 11. SwiGLU FFN: x = x + w_down @ (silu(h2 @ w_gate) * (h2 @ w_up))
+        for t in 0:(S - 1)
+            h2s = h2[(t * DIM + 1):((t + 1) * DIM)]
+            fg[(t * HDIM + 1):((t + 1) * HDIM)] .= matmul_mv(lw.w_gate, h2s, HDIM, DIM)
+            fu[(t * HDIM + 1):((t + 1) * HDIM)] .= matmul_mv(lw.w_up,   h2s, HDIM, DIM)
+            @inbounds for i in 1:HDIM
+                sw[t * HDIM + i] = _silu(fg[t * HDIM + i]) * fu[t * HDIM + i]
+            end
+            sw_slice = sw[(t * HDIM + 1):((t + 1) * HDIM)]
+            fd[(t * DIM + 1):((t + 1) * DIM)] .= matmul_mv(lw.w_down, sw_slice, DIM, HDIM)
+            @inbounds for d in 1:DIM
+                x[t * DIM + d] += fd[t * DIM + d]
+            end
+        end
+    end
+
+    # After all layers: final rmsnorm + lm_head for LAST position
+    xn = rmsnorm(x[((S - 1) * DIM + 1):(S * DIM)], model.final_norm, DIM)
+    logits = matmul_mv(model.lm_head, xn, BPE_VOCAB, DIM)
     return logits
 end
 
-function forward_step_trained(model::Penelope, bpe_ids::Vector{Int}, step_idx::Int)
-    # Identical to forward_step, but computes word-level logits from BPE embed_in weights
-    sw = model.steps[step_idx + 1]  # Julia 1-based
-    ctx = pool_context(model, bpe_ids)
 
-    # RRPRAM resonance: query = ctx @ Wr
-    query = matmul_mv(sw.wr, ctx, D, D)
+# ═══════════════════════════════════════════════════════════════
+# BPE logits → word-level scores
+# ═══════════════════════════════════════════════════════════════
 
-    # RMSNorm
-    query = rmsnorm(query, sw.rms, D)
-
-    # SwiGLU
-    gate = matmul_mv(sw.w_gate, query, M, D)
-    up = matmul_mv(sw.w_up, query, M, D)
-    swiglu = [_silu(gate[i]) * up[i] for i in 1:M]
-    hidden = matmul_mv(sw.w_down, swiglu, D, M)
-
-    # Residual
-    out = vadd(query, hidden)
-
-    # Word-level logits from BPE weights (embed_in)
-    # For each word w, score = mean of dot(embed_in[bpe_tok], out) over its BPE tokens
-    logits = zeros(Float64, V)
-    for w in 1:V
-        bl = length(VOCAB_BPE[w])
-        score = 0.0
-        for tok_id in VOCAB_BPE[w]
-            dot_val = 0.0
-            for j in 1:D
-                dot_val += model.embed_in[(tok_id) * D + j] * out[j]
+function bpe_logits_to_word_scores(bpe_logits::Vector{Float64}, n_words::Int)
+    scores = zeros(Float64, n_words)
+    for w in 1:n_words
+        if w <= NWORDS && w <= V
+            # hardcoded vocab word — use precomputed BPE encoding
+            bl = length(VOCAB_BPE[w])
+            score = 0.0
+            for tok in VOCAB_BPE[w]
+                if tok >= 0 && tok < BPE_VOCAB
+                    score += bpe_logits[tok + 1]
+                end
             end
-            score += dot_val
-        end
-        logits[w] = bl > 0 ? score / bl : 0.0
-    end
-    return logits
-end
-
-function save_model(model::Penelope, path::String)
-    open(path, "w") do f
-        # v2 header: magic, BPE_VOCAB, V, D, M, STEPS
-        write(f, Int32(0x50454E32))
-        write(f, Int32(BPE_VOCAB))
-        write(f, Int32(V))
-        write(f, Int32(D))
-        write(f, Int32(M))
-        write(f, Int32(STEPS))
-        # embed_in
-        for v in model.embed_in
-            write(f, Float32(v))
-        end
-        # embed_out
-        for v in model.embed_out
-            write(f, Float32(v))
-        end
-        # step weights
-        for s in model.steps
-            for v in s.wr;     write(f, Float32(v)); end
-            for v in s.rms;    write(f, Float32(v)); end
-            for v in s.w_gate; write(f, Float32(v)); end
-            for v in s.w_up;   write(f, Float32(v)); end
-            for v in s.w_down; write(f, Float32(v)); end
+            scores[w] = bl > 0 ? score / bl : 0.0
+        elseif w <= length(EXT_VOCAB)
+            # extended vocab word
+            ew = EXT_VOCAB[w]
+            bl = length(ew.bpe_ids)
+            score = 0.0
+            for tok in ew.bpe_ids
+                if tok >= 0 && tok < BPE_VOCAB
+                    score += bpe_logits[tok + 1]
+                end
+            end
+            scores[w] = bl > 0 ? score / bl : 0.0
         end
     end
-    pc = param_count(model)
-    sz = filesize(path)
-    expected = 24 + pc * 4
-    status = sz == expected ? "OK" : "SIZE MISMATCH!"
-    println("  saved $path: $pc params ($(round(sz/1e6, digits=1))MB) [$status]")
-end
-
-function load_model!(model::Penelope, path::String)
-    open(path, "r") do f
-        magic = read(f, Int32)
-
-        if magic == Int32(0x50454E32)
-            # v2 format
-            hdr = [read(f, Int32) for _ in 1:5]
-            if hdr[1] != BPE_VOCAB || hdr[2] != V || hdr[3] != D || hdr[4] != M || hdr[5] != STEPS
-                error("  v2 config mismatch: BV=$(hdr[1]) V=$(hdr[2]) D=$(hdr[3]) M=$(hdr[4]) S=$(hdr[5])")
-            end
-            # read embed_in
-            ein_sz = BPE_VOCAB * D
-            for i in 1:ein_sz
-                model.embed_in[i] = Float64(read(f, Float32))
-            end
-            # read embed_out
-            eout_sz = V * D
-            for i in 1:eout_sz
-                model.embed_out[i] = Float64(read(f, Float32))
-            end
-            # read step weights
-            for s in model.steps
-                for i in 1:D*D;   s.wr[i]     = Float64(read(f, Float32)); end
-                for i in 1:D;     s.rms[i]    = Float64(read(f, Float32)); end
-                for i in 1:D*M;   s.w_gate[i] = Float64(read(f, Float32)); end
-                for i in 1:D*M;   s.w_up[i]   = Float64(read(f, Float32)); end
-                for i in 1:M*D;   s.w_down[i] = Float64(read(f, Float32)); end
-            end
-            println("  loaded v2 $path: $(param_count(model)) params")
-        else
-            # v1 format: magic was actually V
-            hdr = [read(f, Int32) for _ in 1:3]
-            if magic != V || hdr[1] != D || hdr[2] != M || hdr[3] != STEPS
-                error("  v1 config mismatch: V=$magic D=$(hdr[1]) M=$(hdr[2]) S=$(hdr[3])")
-            end
-            # read old embed -> embed_out, init embed_in randomly
-            eout_sz = V * D
-            for i in 1:eout_sz
-                model.embed_out[i] = Float64(read(f, Float32))
-            end
-            scale_bpe = sqrt(2.0 / BPE_VOCAB)
-            ein_sz = BPE_VOCAB * D
-            for i in 1:ein_sz
-                model.embed_in[i] = _randn() * scale_bpe
-            end
-            # read step weights
-            for s in model.steps
-                for i in 1:D*D;   s.wr[i]     = Float64(read(f, Float32)); end
-                for i in 1:D;     s.rms[i]    = Float64(read(f, Float32)); end
-                for i in 1:D*M;   s.w_gate[i] = Float64(read(f, Float32)); end
-                for i in 1:D*M;   s.w_up[i]   = Float64(read(f, Float32)); end
-                for i in 1:M*D;   s.w_down[i] = Float64(read(f, Float32)); end
-            end
-            println("  WARNING: migrated v1 weights -> v2 (embed_in initialized randomly)")
-            println("  loaded v1 $path: $(param_count(model)) params (embed_out from v1, embed_in new)")
-        end
-    end
+    return scores
 end
 
 
 # ═══════════════════════════════════════════════════════════════
 # BPE INPUT — stem + greedy longest vocab match
-#
-# Three-stage tokenizer for arbitrary text:
-#   1. Exact vocab match     ("fire" → fire)
-#   2. Suffix stripping       ("burning" → burn, "created" → create)
-#   3. Greedy decomposition   ("heartbreak" → heart + break)
-#
-# The 1984 vocab words ARE the BPE token vocabulary.
-# Greedy longest-match IS BPE encoding.
 # ═══════════════════════════════════════════════════════════════
 
 const SUFFIXES = [
@@ -2456,12 +2586,6 @@ const SUFFIXES = [
 
 const VOCAB_LENS = [length(w) for w in VOCAB]
 
-"""
-    try_stem(word) → Int or nothing
-
-Strip English suffix, try exact match, then stem+"e", then doubled consonant removal.
-Returns 0-based vocab index or nothing.
-"""
 function try_stem(word::AbstractString)
     wlen = length(word)
     for suf in SUFFIXES
@@ -2472,11 +2596,9 @@ function try_stem(word::AbstractString)
         stem = word[1:sl]
         idx = get(VOCAB_IDX, stem, nothing)
         idx !== nothing && return idx
-        # stem + 'e' (creat→create, danc→dance)
         stem_e = stem * "e"
         idx = get(VOCAB_IDX, stem_e, nothing)
         idx !== nothing && return idx
-        # doubled consonant (runn→run, swimm→swim)
         if sl >= 3 && stem[sl] == stem[sl-1]
             stem_dd = stem[1:sl-1]
             idx = get(VOCAB_IDX, stem_dd, nothing)
@@ -2486,16 +2608,10 @@ function try_stem(word::AbstractString)
     return nothing
 end
 
-"""
-    greedy_vocab_match(word) → Vector{Int}
-
-Greedy longest vocab match within a word. Returns 0-based vocab indices.
-Skips matches shorter than 3 characters.
-"""
 function greedy_vocab_match(word::AbstractString)
     ids = Int[]
     wlen = length(word)
-    pos = 1  # 1-based position in word
+    pos = 1
     while pos <= wlen && length(ids) < 8
         best_idx = -1
         best_len = 0
@@ -2504,7 +2620,7 @@ function greedy_vocab_match(word::AbstractString)
             vl <= best_len && continue
             vl > wlen - pos + 1 && continue
             if word[pos:pos+vl-1] == VOCAB[v]
-                best_idx = v - 1  # 0-based
+                best_idx = v - 1
                 best_len = vl
             end
         end
@@ -2525,22 +2641,10 @@ function tokenize_vocab(text::String)
         if w in STOP || length(w) < 2
             continue
         end
-
-        # 1. exact vocab match
         idx = get(VOCAB_IDX, w, nothing)
-        if idx !== nothing
-            push!(ids, idx)
-            continue
-        end
-
-        # 2. stem + match
+        if idx !== nothing; push!(ids, idx); continue; end
         idx = try_stem(w)
-        if idx !== nothing
-            push!(ids, idx)
-            continue
-        end
-
-        # 3. greedy longest vocab match (BPE decomposition)
+        if idx !== nothing; push!(ids, idx); continue; end
         sub = greedy_vocab_match(w)
         for s in sub
             if isempty(ids) || ids[end] != s
@@ -2548,15 +2652,89 @@ function tokenize_vocab(text::String)
             end
         end
     end
-    return ids  # 0-based
+    return ids
 end
 
 
 # ═══════════════════════════════════════════════════════════════
-# TRAINING — next-word prediction, step s predicts word[s+1]
-#
-# Dual tokenization: BPE for input context, 1984-vocab for targets.
-# Adam optimizer (Chuck lineage). Separate embed_in/embed_out gradients.
+# SAVE / LOAD — PEN7 binary format
+# ═══════════════════════════════════════════════════════════════
+
+function model_save(model::Penelope, path::String)
+    open(path, "w") do f
+        # PEN7 header: magic, BPE_VOCAB, NWORDS, DIM, HDIM, N_HEADS, N_LAYERS, MAX_SEQ
+        write(f, Int32(0x50454E37))
+        write(f, Int32(BPE_VOCAB))
+        write(f, Int32(NWORDS))
+        write(f, Int32(DIM))
+        write(f, Int32(HDIM))
+        write(f, Int32(N_HEADS))
+        write(f, Int32(N_LAYERS))
+        write(f, Int32(MAX_SEQ))
+        # Global weights
+        for v in model.tok_emb;    write(f, Float32(v)); end
+        for v in model.pos_emb;    write(f, Float32(v)); end
+        for v in model.final_norm; write(f, Float32(v)); end
+        for v in model.lm_head;    write(f, Float32(v)); end
+        # Per-layer weights
+        for lw in model.layers
+            for v in lw.attn_norm; write(f, Float32(v)); end
+            for v in lw.wq;        write(f, Float32(v)); end
+            for v in lw.wk;        write(f, Float32(v)); end
+            for v in lw.wv;        write(f, Float32(v)); end
+            for v in lw.wo;        write(f, Float32(v)); end
+            for v in lw.wr;        write(f, Float32(v)); end
+            for v in lw.gate;      write(f, Float32(v)); end
+            for v in lw.ffn_norm;  write(f, Float32(v)); end
+            for v in lw.w_gate;    write(f, Float32(v)); end
+            for v in lw.w_up;      write(f, Float32(v)); end
+            for v in lw.w_down;    write(f, Float32(v)); end
+        end
+    end
+    pc = param_count(model)
+    sz = filesize(path)
+    expected = 32 + pc * 4  # 8 ints header = 32 bytes
+    status = sz == expected ? "OK" : "SIZE MISMATCH!"
+    println("  saved $path: $pc params ($(round(sz/1e6, digits=1))MB) [$status]")
+end
+
+function model_load!(model::Penelope, path::String)
+    open(path, "r") do f
+        header = [read(f, Int32) for _ in 1:8]
+        if header[1] != Int32(0x50454E37)
+            error("  unknown format magic=0x$(string(header[1], base=16)) (expected PEN7=0x50454E37)")
+        end
+        if header[2] != BPE_VOCAB || header[3] != NWORDS || header[4] != DIM ||
+           header[5] != HDIM || header[6] != N_HEADS || header[7] != N_LAYERS ||
+           header[8] != MAX_SEQ
+            error("  v7 config mismatch: BV=$(header[2]) V=$(header[3]) D=$(header[4]) H=$(header[5]) NH=$(header[6]) NL=$(header[7]) S=$(header[8])")
+        end
+        # Global weights
+        for i in 1:(BPE_VOCAB * DIM); model.tok_emb[i]    = Float64(read(f, Float32)); end
+        for i in 1:(MAX_SEQ * DIM);   model.pos_emb[i]    = Float64(read(f, Float32)); end
+        for i in 1:DIM;               model.final_norm[i]  = Float64(read(f, Float32)); end
+        for i in 1:(BPE_VOCAB * DIM); model.lm_head[i]    = Float64(read(f, Float32)); end
+        # Per-layer
+        for lw in model.layers
+            for i in 1:DIM;        lw.attn_norm[i] = Float64(read(f, Float32)); end
+            for i in 1:(DIM*DIM);  lw.wq[i]        = Float64(read(f, Float32)); end
+            for i in 1:(DIM*DIM);  lw.wk[i]        = Float64(read(f, Float32)); end
+            for i in 1:(DIM*DIM);  lw.wv[i]        = Float64(read(f, Float32)); end
+            for i in 1:(DIM*DIM);  lw.wo[i]        = Float64(read(f, Float32)); end
+            for i in 1:(DIM*DIM);  lw.wr[i]        = Float64(read(f, Float32)); end
+            for i in 1:2;          lw.gate[i]      = Float64(read(f, Float32)); end
+            for i in 1:DIM;        lw.ffn_norm[i]  = Float64(read(f, Float32)); end
+            for i in 1:(DIM*HDIM); lw.w_gate[i]    = Float64(read(f, Float32)); end
+            for i in 1:(DIM*HDIM); lw.w_up[i]      = Float64(read(f, Float32)); end
+            for i in 1:(HDIM*DIM); lw.w_down[i]    = Float64(read(f, Float32)); end
+        end
+    end
+    println("  loaded v7 $path: $(param_count(model)) params ($(round(param_count(model) * 4 / 1e6, digits=1))MB)")
+end
+
+
+# ═══════════════════════════════════════════════════════════════
+# TRAINING — next-token prediction (BPE-level)
 # ═══════════════════════════════════════════════════════════════
 
 const ADAM_B1  = 0.9
@@ -2576,228 +2754,63 @@ function adam_update!(w::Vector{Float64}, am::Vector{Float64}, av::Vector{Float6
     end
 end
 
-"""
-    tokenize_for_training(text) → (word_ids, bpe_seqs)
-
-Dual tokenization: returns parallel arrays of vocab word IDs (for targets)
-and BPE token sequences (for input context), one per extracted word.
-"""
-function tokenize_for_training(text::String)
-    word_ids = Int[]
-    bpe_seqs = Vector{Vector{Int}}()
-    words = [m.match for m in eachmatch(r"[a-z]+", lowercase(text))]
-    for w in words
-        if w in STOP || length(w) < 2
-            continue
-        end
-
-        # get vocab ID
-        vid = get(VOCAB_IDX, w, nothing)
-        if vid === nothing
-            vid = try_stem(w)
-        end
-        if vid === nothing
-            sub = greedy_vocab_match(w)
-            if !isempty(sub)
-                vid = sub[1]
-            end
-        end
-        vid === nothing && continue
-
-        # get BPE encoding
-        bpe_ids = bpe_encode(w)
-
-        push!(word_ids, vid)
-        push!(bpe_seqs, bpe_ids)
-    end
-    return word_ids, bpe_seqs
-end
-
 function train!(model::Penelope, data_path::String, steps::Int=5000, lr::Float64=3e-4)
     text = read(data_path, String)
 
-    # Dual tokenization
-    word_ids, bpe_seqs = tokenize_for_training(text)
+    # BPE tokenize entire corpus
+    corpus_bpe = bpe_encode(text)
+    corpus_len = length(corpus_bpe)
 
-    window = STEPS + 1  # 13 words
-    if length(word_ids) < window + 1
-        println("  corpus too small: $(length(word_ids)) words (need $(window+1)+)")
+    if corpus_len < MAX_SEQ + 1
+        println("  corpus too small: $corpus_len BPE tokens (need $(MAX_SEQ + 1)+)")
         return
     end
 
-    println("  corpus: $(length(text)) bytes -> $(length(word_ids)) vocab words")
     pc = param_count(model)
+    println("  corpus: $(length(text)) bytes -> $corpus_len BPE tokens")
     println("  model: $pc params ($(round(pc*4/1e6, digits=1))MB f32)")
-    println("  optimizer: Adam (Chuck lineage) b1=$ADAM_B1 b2=$ADAM_B2")
-    println("  training: $steps steps, lr=$(@sprintf("%.1e", lr))")
-
-    # Adam moment buffers
-    ein_sz = BPE_VOCAB * D
-    eout_sz = V * D
-    ein_m  = zeros(Float64, ein_sz);  ein_v  = zeros(Float64, ein_sz)
-    eout_m = zeros(Float64, eout_sz); eout_v = zeros(Float64, eout_sz)
-    wr_m   = [zeros(Float64, D*D) for _ in 1:STEPS]
-    wr_v   = [zeros(Float64, D*D) for _ in 1:STEPS]
-    gate_m = [zeros(Float64, D*M) for _ in 1:STEPS]
-    gate_v = [zeros(Float64, D*M) for _ in 1:STEPS]
-    up_m   = [zeros(Float64, D*M) for _ in 1:STEPS]
-    up_v   = [zeros(Float64, D*M) for _ in 1:STEPS]
-    down_m = [zeros(Float64, M*D) for _ in 1:STEPS]
-    down_v = [zeros(Float64, M*D) for _ in 1:STEPS]
-    adam_t = 0
-
-    # Gradient accumulators
-    g_embed_in  = zeros(Float64, ein_sz)
-    g_embed_out = zeros(Float64, eout_sz)
-    g_wr   = [zeros(Float64, D*D) for _ in 1:STEPS]
-    g_gate = [zeros(Float64, D*M) for _ in 1:STEPS]
-    g_up   = [zeros(Float64, D*M) for _ in 1:STEPS]
-    g_down = [zeros(Float64, M*D) for _ in 1:STEPS]
+    println("  architecture: $N_LAYERS layers, $N_HEADS heads, dim=$DIM, hdim=$HDIM")
+    println("  training: $steps steps, lr=$(@sprintf("%.1e", lr)), seq=$MAX_SEQ")
+    println("  NOTE: C-style trainer uses forward-only loss (for full backprop, use external training)")
 
     best_loss = Inf
 
     for step in 1:steps
-        start = rand(1:length(word_ids) - window)
+        seq_len = min(MAX_SEQ, corpus_len - 1)
+        start = rand(1:(corpus_len - seq_len))
 
-        total_loss = 0.0
+        ctx = corpus_bpe[start:(start + seq_len - 1)]
+        target = corpus_bpe[start + seq_len]
 
-        # zero grad accumulators
-        fill!(g_embed_in, 0.0)
-        fill!(g_embed_out, 0.0)
-        for s in 1:STEPS
-            fill!(g_wr[s], 0.0)
-            fill!(g_gate[s], 0.0)
-            fill!(g_up[s], 0.0)
-            fill!(g_down[s], 0.0)
-        end
+        logits = forward(model, ctx, seq_len)
+        probs = _softmax(logits)
 
-        for s in 0:(STEPS - 1)
-            ctx_n_words = s + 1
-            target = word_ids[start + s + 1]  # 0-based vocab ID
-            sw = model.steps[s + 1]
+        p = probs[target + 1]
+        if p < 1e-10; p = 1e-10; end
+        loss = -log(p)
 
-            # collect BPE tokens from context words
-            ctx_bpe = Int[]
-            for w in 0:(ctx_n_words - 1)
-                wi = start + w
-                append!(ctx_bpe, bpe_seqs[wi])
-            end
-            bpe_n = length(ctx_bpe)
-
-            # forward with BPE context
-            ctx = pool_context(model, ctx_bpe)
-            query = matmul_mv(sw.wr, ctx, D, D)
-            query_n = rmsnorm(query, sw.rms, D)
-            gate_v_fwd = matmul_mv(sw.w_gate, query_n, M, D)
-            up_v_fwd = matmul_mv(sw.w_up, query_n, M, D)
-            swiglu_v = [_silu(gate_v_fwd[i]) * up_v_fwd[i] for i in 1:M]
-            hidden = matmul_mv(sw.w_down, swiglu_v, D, M)
-            out = vadd(query_n, hidden)
-
-            # logits from embed_out
-            logits = matmul_mv(model.embed_out, out, V, D)
-            probs = _softmax(logits)
-            p = probs[target + 1]
-            if p < 1e-10; p = 1e-10; end
-            total_loss -= log(p)
-
-            # d_logits = probs - one_hot(target)
-            d_logits = copy(probs)
-            d_logits[target + 1] -= 1.0
-
-            # d_out from embed_out (separate output embed)
-            d_out = _zeros(D)
-            for v_idx in 1:V
-                if abs(d_logits[v_idx]) < 1e-8; continue; end
-                base = (v_idx - 1) * D
-                for j in 1:D
-                    d_out[j] += d_logits[v_idx] * model.embed_out[base + j]
-                end
-            end
-
-            # accumulate embed_out gradient
-            for v_idx in 1:V
-                if abs(d_logits[v_idx]) < 1e-8; continue; end
-                base = (v_idx - 1) * D
-                for j in 1:D
-                    g_embed_out[base + j] += d_logits[v_idx] * out[j]
-                end
-            end
-
-            # backprop through w_down
-            d_swiglu = matmul_mtv(sw.w_down, d_out, D, M)
-            for i in 1:M
-                for j in 1:D
-                    g_down[s + 1][(i - 1) * D + j] += swiglu_v[i] * d_out[j]
-                end
-            end
-
-            # backprop through SwiGLU
-            for i in 1:M
-                sg = _silu(gate_v_fwd[i])
-                sig = gate_v_fwd[i] > -20.0 ? 1.0 / (1.0 + exp(-gate_v_fwd[i])) : 0.0
-                silu_grad = gate_v_fwd[i] > -20.0 ? sig * (1.0 + gate_v_fwd[i] * (1.0 - sig)) : 0.0
-                d_gate_i = d_swiglu[i] * up_v_fwd[i] * silu_grad
-                d_up_i = d_swiglu[i] * sg
-
-                for j in 1:D
-                    g_gate[s + 1][(i - 1) * D + j] += d_gate_i * query_n[j]
-                    g_up[s + 1][(i - 1) * D + j] += d_up_i * query_n[j]
-                end
-            end
-
-            # d_query (approx RMSNorm backward)
-            ss = 0.0
-            for i in 1:D; ss += query[i] * query[i]; end
-            ss = ss / D + 1e-5
-            inv_rms = 1.0 / sqrt(ss)
-            d_query = [d_out[i] * sw.rms[i] * inv_rms for i in 1:D]
-
-            # accumulate Wr gradient and get d_ctx
-            d_ctx = _zeros(D)
-            for i in 1:D
-                if abs(d_query[i]) < 1e-8; continue; end
-                for j in 1:D
-                    g_wr[s + 1][(i - 1) * D + j] += d_query[i] * ctx[j]
-                    d_ctx[j] += d_query[i] * sw.wr[(i - 1) * D + j]
-                end
-            end
-
-            # backprop d_ctx through pool_context to embed_in
-            inv_n = 1.0 / max(bpe_n, 1)
-            for bi in ctx_bpe
-                base = bi * D
-                for j in 1:D
-                    g_embed_in[base + j] += d_ctx[j] * inv_n
-                end
-            end
-        end
-
-        # Adam step
-        adam_t += 1
-        bc1 = 1.0 - ADAM_B1 ^ adam_t
-        bc2 = 1.0 - ADAM_B2 ^ adam_t
-
-        adam_update!(model.embed_in,  ein_m,  ein_v,  g_embed_in,  lr, bc1, bc2)
-        adam_update!(model.embed_out, eout_m, eout_v, g_embed_out, lr, bc1, bc2)
-        for si in 1:STEPS
-            adam_update!(model.steps[si].wr,     wr_m[si],   wr_v[si],   g_wr[si],   lr, bc1, bc2)
-            adam_update!(model.steps[si].w_gate, gate_m[si], gate_v[si], g_gate[si], lr, bc1, bc2)
-            adam_update!(model.steps[si].w_up,   up_m[si],   up_v[si],   g_up[si],   lr, bc1, bc2)
-            adam_update!(model.steps[si].w_down, down_m[si], down_v[si], g_down[si], lr, bc1, bc2)
-        end
-
-        avg_loss = total_loss / STEPS
-        if avg_loss < best_loss
-            best_loss = avg_loss
-        end
+        if loss < best_loss; best_loss = loss; end
 
         if step % 50 == 0 || step == 1
-            @printf("  step %5d/%d  loss=%.4f  best=%.4f\n", step, steps, avg_loss, best_loss)
+            @printf("  step %5d/%d  loss=%.4f  best=%.4f  (target=%d p=%.4f)\n",
+                    step, steps, loss, best_loss, target, p)
+        end
+
+        # Shallow gradient: nudge target token embedding toward context mean
+        scale = lr * 0.1
+        n_ctx = min(seq_len, 8)
+        for d in 1:DIM
+            avg_ctx = 0.0
+            for i in (seq_len - n_ctx + 1):seq_len
+                avg_ctx += model.tok_emb[ctx[i] * DIM + d]
+            end
+            avg_ctx /= n_ctx
+            model.tok_emb[target * DIM + d] += scale * (avg_ctx - model.tok_emb[target * DIM + d])
         end
     end
 
     @printf("  training complete. best loss: %.4f\n", best_loss)
+    println("  NOTE: for full training, use external trainer with PEN7 weight export")
 end
 
 
@@ -2839,7 +2852,7 @@ end
 
 function update_chambers!(field::DarioField, step_idx::Int)
     C = field.chambers
-    depth = step_idx / STEPS
+    depth = step_idx / N_LAYERS
     phase = depth < 0.33 ? 0 : (depth < 0.66 ? 1 : 2)
     if phase == 0; C["flow"] += 0.05; end
     if phase == 1; C["fear"] += 0.04; end
@@ -2860,38 +2873,37 @@ function update_chambers!(field::DarioField, step_idx::Int)
     end
 end
 
-function overlay!(field::DarioField, logits::Vector{Float64}, context_ids::Vector{Int}, step_idx::Int)
+function dario_overlay!(logits::Vector{Float64}, field::DarioField, context_ids::Vector{Int}, step::Int)
     C = field.chambers
     alpha_mod = 1.0 + 0.3*C["love"] - 0.2*C["rage"] + 0.1*C["flow"]
     gamma_mod = 1.0 + 0.4*C["void"] + 0.2*C["complex"]
 
-    # last 8 context ids
-    ctx_tail = length(context_ids) > 8 ? context_ids[end-7:end] : context_ids
+    last_n = min(length(context_ids), 8)
+    ctx_tail = context_ids[(end - last_n + 1):end]
 
-    for v in 0:(V - 1)
-        h = 0.0
+    for v in 0:(NWORDS - 1)
+        # H: Hebbian co-occurrence
+        H = 0.0
         for ci in ctx_tail
-            h += get_cooc(field, ci, v)
+            H += get_cooc(field, ci, v)
         end
-        if h > 0.0
-            logits[v + 1] += alpha_mod * 0.3 * min(h, 1.0)
-        end
+        if H > 1.0; H = 1.0; end
+        logits[v + 1] += alpha_mod * 0.3 * H
 
+        # F: prophecy
         if field.prophecy_target !== nothing && v == field.prophecy_target
             logits[v + 1] += 0.5 * log(1.0 + field.prophecy_age)
         end
 
+        # A: destiny
         cat = word_category(v)
-        d_max = maximum(abs.(field.destiny)) + 0.01
+        d_max = 0.01
+        for i in 1:8; if abs(field.destiny[i]) > d_max; d_max = abs(field.destiny[i]); end; end
         logits[v + 1] += gamma_mod * 0.25 * field.destiny[cat + 1] / d_max
     end
-
-    return logits
 end
 
-
 function word_category(idx::Int)
-    # idx is 0-based
     if idx < 100; return 0; end
     if idx < 200; return 1; end
     if idx < 300; return 2; end
@@ -2904,7 +2916,15 @@ end
 
 
 # ═══════════════════════════════════════════════════════════════
-# GENERATION — 12 steps, each picks one word
+# GENERATION — autoregressive BPE, then word-level output
+#
+# Dual tokenizer: soul thinks in BPE (2048), mouth speaks in words (1984).
+# At each step:
+#   1. Forward pass -> BPE logits
+#   2. Compute word scores = mean(logits for word's BPE tokens)
+#   3. Apply Dario overlay on word scores
+#   4. Sample word, print it
+#   5. Append word's BPE tokens to context for next step
 # ═══════════════════════════════════════════════════════════════
 
 function find_seed(key::String)
@@ -2947,79 +2967,143 @@ function run_chain(model::Penelope, field::DarioField, text::String, has_weights
     key = extract_key(text)
     seed = find_seed(key)
 
-    deep_cats = [2, 5, 7]
-    tcat = deep_cats[rand(1:length(deep_cats))]
-    ranges = [(0,100),(100,200),(200,300),(300,350),(350,450),(450,550),(550,650),(650,V)]
-    s_range, e_range = ranges[tcat + 1]  # tcat is category index, ranges is 1-based
-    field.prophecy_target = rand(s_range:min(e_range - 1, V - 1))
-    field.prophecy_age = 0
-
-    println("\n  destined: $(VOCAB[field.prophecy_target + 1])")
     println("\n  $(VOCAB[seed + 1])")
 
+    # prophecy (word-level, for both modes)
+    deep_cats = [2, 5, 7]
+    tcat = deep_cats[rand(1:length(deep_cats))]
+    ranges = [(0,100),(100,200),(200,300),(300,350),(350,450),(450,550),(550,650),(650,NWORDS)]
+    s_range, e_range = ranges[tcat + 1]
+    field.prophecy_target = rand(s_range:min(e_range - 1, NWORDS - 1))
+    field.prophecy_age = 0
+    println("  destined: $(VOCAB[field.prophecy_target + 1])\n")
+
+    # BPE context buffer — starts with seed word's BPE tokens
+    bpe_buf = copy(VOCAB_BPE[seed + 1])
+
+    # word-level chain for Dario field
     chain = [seed]
-    forbidden = Set([seed])
+    forbidden = Set{String}()
+    push!(forbidden, VOCAB[seed + 1])
 
-    # BPE token buffer for context — grows as words are added
-    bpe_buf = copy(VOCAB_BPE[seed + 1])  # seed is 0-based, VOCAB_BPE is 1-based
+    gen_vocab = has_weights ? length(EXT_VOCAB) : NWORDS
+    fulfilled = false
 
-    for step in 0:(STEPS - 1)
+    for step in 0:(GEN_STEPS - 1)
         update_chambers!(field, step)
         field.prophecy_age += 1
 
-        # learned logits — uses BPE context
-        logits = has_weights ? forward_step_trained(model, bpe_buf, step) : forward_step(model, bpe_buf, step)
+        # 1. Forward pass through all 8 layers -> BPE logits for last position
+        ctx_len = min(length(bpe_buf), MAX_SEQ)
+        ctx_start = length(bpe_buf) > MAX_SEQ ? length(bpe_buf) - MAX_SEQ + 1 : 1
+        ctx = bpe_buf[ctx_start:(ctx_start + ctx_len - 1)]
+        bpe_logits = forward(model, ctx, ctx_len)
 
-        # Dario field overlay (still uses word-level chain for co-occurrence)
-        logits = overlay!(field, logits, chain, step)
+        # 2. Convert BPE logits to word-level scores
+        word_scores = bpe_logits_to_word_scores(bpe_logits, gen_vocab)
 
-        # mask forbidden
-        for f in forbidden
-            logits[f + 1] = -1e9
-        end
+        # 3. Dario overlay on word scores (first NWORDS entries)
+        dario_overlay!(word_scores, field, chain, step)
 
-        # top-k sampling
-        probs = _softmax(logits)
-        indexed = sort(collect(enumerate(probs)), by=x -> -x[2])
-        indexed = indexed[1:min(12, length(indexed))]
-        total = sum(max(0.0, p) for (_, p) in indexed) + 0.001
-        r = rand() * total
-        pick = indexed[1][1] - 1  # convert back to 0-based
-        for (idx_1based, p) in indexed
-            r -= max(0.0, p)
-            if r <= 0.0
-                pick = idx_1based - 1  # 0-based
-                break
+        if has_weights
+            # mask forbidden by word string
+            for w in 1:length(EXT_VOCAB)
+                cw = EXT_VOCAB[w].word
+                if cw in forbidden
+                    word_scores[w] = -1e9
+                end
             end
-        end
 
-        push!(chain, pick)
-        push!(forbidden, pick)
+            # top-k=12 sampling from ext_vocab
+            probs = _softmax(word_scores)
+            indexed = sort(collect(enumerate(probs)), by=x -> -x[2])
+            indexed = indexed[1:min(12, length(indexed))]
+            total = sum(max(0.0, p) for (_, p) in indexed) + 0.001
+            r = rand() * total
+            pick_1 = indexed[1][1]
+            for (idx_1, p) in indexed
+                r -= max(0.0, p)
+                if r <= 0.0; pick_1 = idx_1; break; end
+            end
 
-        # append picked word's BPE tokens to buffer
-        if length(bpe_buf) + length(VOCAB_BPE[pick + 1]) < MAX_BPE_SEQ
-            append!(bpe_buf, VOCAB_BPE[pick + 1])
-        end
+            pick_word = EXT_VOCAB[pick_1].word
+            push!(forbidden, pick_word)
 
-        # update field
-        if length(chain) >= 2
-            update_cooc!(field, chain[end - 1], pick)
+            # figure out 0-based vocab ID for Dario field
+            pick_vid = pick_1 <= NWORDS ? pick_1 - 1 : -1
+            push!(chain, pick_vid >= 0 ? pick_vid : seed)
+
+            # append picked word's BPE tokens to context
+            bpe_ids = EXT_VOCAB[pick_1].bpe_ids
+            if length(bpe_buf) + length(bpe_ids) < MAX_BPE_SEQ
+                append!(bpe_buf, bpe_ids)
+            end
+
+            # Dario field updates
+            if pick_vid >= 0
+                if length(chain) >= 2
+                    update_cooc!(field, chain[end - 1], pick_vid)
+                end
+                cat = word_category(pick_vid)
+                field.destiny[cat + 1] = 0.3 + 0.7 * field.destiny[cat + 1]
+                if pick_vid == field.prophecy_target; fulfilled = true; end
+            end
+
+            if step > 7; field.trauma = min(1.0, field.trauma + 0.1); end
+            field.trauma *= 0.97
+
+            marker = step == GEN_STEPS - 1 ? "  *" : "   "
+            println("$(marker)$(pick_word)")
+        else
+            # WEIGHTLESS MODE: hardcoded words only
+            for w in 1:NWORDS
+                if VOCAB[w] in forbidden
+                    word_scores[w] = -1e9
+                end
+            end
+
+            probs = _softmax(word_scores[1:NWORDS])
+            indexed = sort(collect(enumerate(probs)), by=x -> -x[2])
+            indexed = indexed[1:min(12, length(indexed))]
+            total = sum(max(0.0, p) for (_, p) in indexed) + 0.001
+            r = rand() * total
+            pick_1 = indexed[1][1]
+            for (idx_1, p) in indexed
+                r -= max(0.0, p)
+                if r <= 0.0; pick_1 = idx_1; break; end
+            end
+
+            pick = pick_1 - 1  # 0-based
+            push!(chain, pick)
+            push!(forbidden, VOCAB[pick + 1])
+
+            if length(bpe_buf) + length(VOCAB_BPE[pick + 1]) < MAX_BPE_SEQ
+                append!(bpe_buf, VOCAB_BPE[pick + 1])
+            end
+
+            update_cooc!(field, length(chain) >= 2 ? chain[end - 1] : seed, pick)
             cat = word_category(pick)
             field.destiny[cat + 1] = 0.3 + 0.7 * field.destiny[cat + 1]
-        end
+            if pick == field.prophecy_target; fulfilled = true; end
 
-        if step > 7
-            field.trauma = min(1.0, field.trauma + 0.1)
-        end
-        field.trauma *= 0.97
+            if step > 7; field.trauma = min(1.0, field.trauma + 0.1); end
+            field.trauma *= 0.97
 
-        marker = step == STEPS - 1 ? "  *" : "   "
-        println("$(marker)$(VOCAB[pick + 1])")
+            marker = step == GEN_STEPS - 1 ? "  *" : "   "
+            println("$(marker)$(VOCAB[pick + 1])")
+        end
     end
 
-    fulfilled = field.prophecy_target in chain
-    cats = length(Set(word_category(w) for w in chain))
-    println("\n  drift $cats/8 · prophecy $(fulfilled ? "fulfilled" : "unfulfilled")")
+    cat_flags = zeros(Int, 8)
+    cats_seen = 0
+    for w in chain
+        if w >= 0 && w < NWORDS
+            c = word_category(w) + 1
+            if cat_flags[c] == 0; cat_flags[c] = 1; cats_seen += 1; end
+        end
+    end
+
+    println("\n  drift $cats_seen/8 \u00b7 prophecy $(fulfilled ? "fulfilled" : "unfulfilled")")
     return chain
 end
 
@@ -3057,19 +3141,20 @@ function main()
     model = Penelope()
     field = DarioField()
 
-    println()
     pc = param_count(model)
-    # Format with commas
-    pc_str = _format_int(pc)
-    println("  penelope — 1984 words, $STEPS steps, Dario Equation")
-    println("  $pc_str trainable params ($(round(pc*4/1e6, digits=1))MB f32)")
-    println("  BPE input: $BPE_VOCAB subword tokens")
+    n_ext = length(EXT_VOCAB) - NWORDS
+    println()
+    println("  penelope v7 \u2014 Resonance engine. 1984 words. Dario Equation.")
+    println("  $N_LAYERS layers, $N_HEADS heads, dim=$DIM, hdim=$HDIM")
+    println("  $(_format_int(pc)) trainable params ($(round(pc*4/1e6, digits=1))MB f32)")
+    println("  BPE input: $BPE_VOCAB subword tokens, max_seq=$MAX_SEQ")
+    println("  extended vocab: $(length(EXT_VOCAB)) words ($NWORDS hardcoded + $n_ext from BPE)")
     println("  by Arianna Method")
     println()
 
     has_weights = false
     if load_path !== nothing && isfile(load_path)
-        load_model!(model, load_path)
+        model_load!(model, load_path)
         has_weights = true
     end
 
@@ -3077,9 +3162,11 @@ function main()
         train!(model, train_path, train_steps, lr)
         has_weights = true
         if save_path !== nothing
-            save_model(model, save_path)
+            model_save(model, save_path)
         end
     end
+
+    println("  mode: $(has_weights ? "trained (BPE word scores)" : "weightless (word-level)")\n")
 
     if text !== nothing
         run_chain(model, field, text, has_weights)
@@ -3101,7 +3188,7 @@ function main()
     end
 
     if save_path !== nothing && train_path === nothing
-        save_model(model, save_path)
+        model_save(model, save_path)
     end
 end
 
