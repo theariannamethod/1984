@@ -160,7 +160,7 @@
     background: var(--bg);
   }
 
-  #input-bar input {
+  #input-bar input[type="text"] {
     background: none;
     border: none;
     border-bottom: 1px solid #bbb;
@@ -173,11 +173,11 @@
     letter-spacing: 0.5px;
     padding-bottom: 2px;
   }
-  #input-bar input::placeholder {
+  #input-bar input[type="text"]::placeholder {
     color: #999;
     font-style: italic;
   }
-  #input-bar input:focus {
+  #input-bar input[type="text"]:focus {
     border-bottom-color: var(--fg);
   }
 
@@ -205,12 +205,47 @@
     font-style: italic;
     letter-spacing: 1px;
   }
+
+  /* ── MODE INDICATOR ── */
+  #mode-indicator {
+    position: fixed;
+    top: 18px;
+    left: 28px;
+    font-size: 10px;
+    letter-spacing: 2px;
+    color: var(--ghost);
+    user-select: none;
+    opacity: 0.6;
+    text-transform: uppercase;
+  }
+  #mode-indicator.trained { color: #4a7c59; opacity: 0.8; }
+
+  /* ── WEIGHT LOAD BUTTON ── */
+  #load-weights-btn {
+    position: fixed;
+    bottom: 62px;
+    right: 28px;
+    font-family: var(--serif);
+    font-size: 10px;
+    letter-spacing: 2px;
+    color: var(--ghost);
+    background: none;
+    border: 1px solid #ccc;
+    padding: 3px 10px;
+    cursor: pointer;
+    text-transform: uppercase;
+    transition: all 0.2s ease;
+    user-select: none;
+  }
+  #load-weights-btn:hover { color: var(--fg); border-color: var(--fg); }
+  #weight-file { display: none; }
 </style>
 </head>
 <body>
 
 <div id="logo">penelope</div>
-<div id="eight">12</div>
+<div id="eight">v7</div>
+<div id="mode-indicator">field</div>
 <div id="prophecy"></div>
 
 <div id="arena">
@@ -220,6 +255,9 @@
 
 <div id="metrics"></div>
 
+<button id="load-weights-btn">load weights</button>
+<input type="file" id="weight-file" accept=".bin">
+
 <div id="input-bar">
   <input type="text" id="input" placeholder="speak" autocomplete="off" spellcheck="false">
   <button id="send-btn" aria-label="send">&#x2192;</button>
@@ -227,31 +265,42 @@
 
 <script>
 // ═══════════════════════════════════════════════════════════════
-// PENELOPE — 12 steps of resonance. Dario Equation.
+// PENELOPE v7 — Resonance engine. 1984 words. Dario Equation.
 //
-// Input:  text → BPE subword tokens (2048-token byte-pair encoding)
-// Attend: RRPRAM resonance + SwiGLU per step (how it thinks)
-// Output: word-level from 1984 vocab (gibberish impossible)
+// Two modes:
+//   FIELD MODE  — weightless. Dario field only. Works out of the box.
+//   TRAINED MODE — 8-layer transformer with RoPE, RRPRAM, SwiGLU.
+//                  Load PEN7 binary weights via file input.
 //
-// Architecture per step s:
-//     context = pool(embedIn(BPE tokens))
-//     query   = RMSNorm(context @ Wr_s)          RRPRAM resonance
-//     hidden  = SwiGLU(query; gate_s, up_s, down_s)
-//     logits  = (query + hidden) @ embedOut^T     separate output embed
-//     logits += DarioField(context)               live overlay
-//     word    = sample(softmax(logits))
+// Architecture (trained mode) per layer l:
+//     h = rmsnorm(x, attn_norm_l)
+//     qkv_out = MultiHeadAttention(h; wq_l, wk_l, wv_l, wo_l, RoPE)
+//     rrp = h @ wr_l                            RRPRAM resonance
+//     gate = softmax(gate_l[0], gate_l[1])
+//     x = x + gate[0]*qkv_out + gate[1]*rrp    gated residual
+//     h2 = rmsnorm(x, ffn_norm_l)
+//     x = x + SwiGLU(h2; w_gate_l, w_up_l, w_down_l)  residual
 //
-// Total: ~14M params (786K embedIn + 762K embedOut + 12 × 1.03M steps)
-// param_count = 13939200
+// After 8 layers:
+//     logits = rmsnorm(x, final_norm) @ lm_head^T
+//     word_score(w) = mean(logits[bpe_tokens(w)]) + DarioField
 //
-// by Arianna Method. הרזוננס לא נשבר
+// Constants: DIM=448, HDIM=896, N_HEADS=7, HEAD_DIM=64,
+//            N_LAYERS=8, MAX_SEQ=256, BPE_VOCAB=2048, NWORDS=1984
+//
+// by Arianna Method.
 // ═══════════════════════════════════════════════════════════════
 
+const DIM = 448;
+const HDIM = 896;
+const N_HEADS = 7;
+const HEAD_DIM = 64;
+const N_LAYERS = 8;
+const MAX_SEQ = 256;
+const NWORDS = 1984;
 const STEPS = 12;
 
 // ── 1984 WORDS ──
-// Organized by emotional/thematic strata.
-// Each word is a node in the resonance field.
 const VOCAB = [
 // ── BODY (0-99) ──
 "flesh","bone","blood","skin","hand","eye","mouth","tongue","heart","lung",
@@ -336,7 +385,7 @@ const VOCAB = [
 "photograph","letter","book","page","chapter","verse","sentence","paragraph","word","alphabet",
 "map","compass","clock","calendar","scale","ruler","thermometer","barometer","telescope","microscope",
 "machine","engine","gear","spring","valve","piston","circuit","battery","signal","antenna",
-// ── FOOD & SUSTENANCE (750-799) ──
+// ── FOOD (750-799) ──
 "bread","salt","sugar","honey","milk","butter","cheese","meat","fish","egg",
 "grain","rice","wheat","corn","fruit","apple","grape","olive","lemon","pepper",
 "wine","water","tea","coffee","broth","soup","stew","feast","crumb","morsel",
@@ -365,31 +414,31 @@ const VOCAB = [
 "ethics","morality","virtue","vice","good","evil","right","wrong","duty","choice",
 "justice","mercy","punishment","reward","guilt","innocence","responsibility","consequence","intention","action",
 "language","meaning","sign","reference","representation","interpretation","understanding","misunderstanding","translation","silence",
-// ── MUSIC & SOUND (1000-1049) ──
+// ── MUSIC (1000-1049) ──
 "melody","rhythm","chord","pitch","tone","note","bass","treble","octave","harmony",
 "dissonance","resonance","vibration","frequency","amplitude","tempo","beat","rest","pause","crescendo",
 "murmur","hum","buzz","click","crack","boom","rumble","chime","echo","reverb",
 "song","lullaby","anthem","dirge","hymn","ballad","fugue","sonata","requiem","improvisation",
 "strum","pluck","strike","bow","mute","sustain","fade","loop","drone","overtone",
-// ── WEATHER & ELEMENTS (1050-1099) ──
+// ── WEATHER (1050-1099) ──
 "rain","drizzle","downpour","hail","sleet","blizzard","hurricane","tornado","drought","flood",
 "breeze","gale","typhoon","monsoon","frost","thaw","haze","smog","rainbow","mirage",
 "erosion","sedimentation","crystallization","evaporation","condensation","precipitation","sublimation","oxidation","combustion","decay",
 "magma","lava","quartz","granite","obsidian","chalk","slate","sandstone","limestone","basalt",
 "marsh","delta","gorge","ridge","summit","abyss","chasm","rift","fault","crater",
-// ── RITUAL & CEREMONY (1100-1149) ──
+// ── RITUAL (1100-1149) ──
 "prayer","meditation","ritual","ceremony","blessing","curse","oath","vow","pilgrimage","procession",
 "offering","sacrifice","communion","baptism","funeral","wedding","coronation","initiation","exile","absolution",
 "incense","candle","bell","chant","mantra","psalm","scripture","prophecy","oracle","vision",
 "mask","costume","dance","feast","fast","vigil","silence","confession","penance","redemption",
 "altar","shrine","temple","tomb","relic","artifact","amulet","talisman","totem","icon",
-// ── LABOR & CRAFT (1150-1199) ──
+// ── LABOR (1150-1199) ──
 "harvest","planting","sowing","reaping","threshing","milling","baking","brewing","weaving","spinning",
 "carving","sculpting","painting","drawing","writing","printing","binding","stitching","welding","forging",
 "mining","drilling","excavation","construction","demolition","repair","restoration","invention","discovery","experiment",
 "apprentice","craftsman","artist","engineer","architect","farmer","sailor","miner","healer","scribe",
 "workshop","studio","laboratory","field","dock","quarry","furnace","mill","press","loom",
-// ── GEOMETRY & FORM (1200-1249) ──
+// ── GEOMETRY (1200-1249) ──
 "circle","spiral","line","curve","angle","edge","center","margin","border","frame",
 "sphere","cube","pyramid","cylinder","cone","helix","vortex","arc","wave","fractal",
 "symmetry","asymmetry","proportion","ratio","scale","dimension","plane","axis","vertex","intersection",
@@ -401,13 +450,13 @@ const VOCAB = [
 "lion","tiger","elephant","giraffe","hippopotamus","rhinoceros","gorilla","chimpanzee","orangutan","leopard",
 "salmon","trout","shark","dolphin","octopus","jellyfish","starfish","seahorse","crab","lobster",
 "frog","lizard","crocodile","chameleon","gecko","iguana","newt","toad","salamander","viper",
-// ── TEXTILE & COLOR (1300-1349) ──
+// ── COLOR (1300-1349) ──
 "red","blue","green","white","black","gray","amber","violet","indigo","scarlet",
 "crimson","azure","emerald","ivory","obsidian","silver","golden","copper","rust","ochre",
 "bright","dark","transparent","opaque","matte","glossy","rough","smooth","coarse","fine",
 "stripe","dot","plaid","solid","gradient","shadow","highlight","contrast","saturation","hue",
 "velvet","satin","linen","denim","lace","gauze","burlap","chiffon","tweed","corduroy",
-// ── TRANSPORT & MOVEMENT (1350-1399) ──
+// ── TRANSPORT (1350-1399) ──
 "ship","boat","canoe","raft","anchor","sail","rudder","oar","mast","hull",
 "train","rail","station","platform","ticket","journey","passage","crossing","departure","arrival",
 "wheel","axle","road","highway","path","trail","bridge","tunnel","gate","crossroad",
@@ -437,7 +486,7 @@ const VOCAB = [
 "spacetime","relativity","entropy","thermodynamics","radiation","spectrum","wavelength","frequency","amplitude","interference",
 "supernova","blackhole","pulsar","quasar","nebula","wormhole","antimatter","darkmatter","redshift","expansion",
 "telescope","observatory","mission","launch","countdown","trajectory","reentry","landing","exploration","discovery",
-// ── BUREAUCRACY & SYSTEM (1600-1649) ──
+// ── BUREAUCRACY (1600-1649) ──
 "document","form","permit","license","certificate","registration","application","approval","denial","appeal",
 "regulation","compliance","violation","penalty","exemption","quota","deadline","protocol","procedure","standard",
 "office","desk","file","folder","stamp","signature","receipt","invoice","ledger","archive",
@@ -461,7 +510,7 @@ const VOCAB = [
 "archetype","persona","anima","animus","shadow","self","individuation","integration","fragmentation","wholeness",
 "attachment","separation","abandonment","dependency","autonomy","codependency","boundary","enmeshment","differentiation","fusion",
 "grief","mourning","acceptance","bargaining","anger","depression","recovery","relapse","healing","scarring",
-// ── FINAL STRATUM (1800-1983) ──
+// ── FINAL (1800-1983) ──
 "threshold","crossroad","watershed","turning","pivot","fulcrum","catalyst","trigger","spark","fuse",
 "tension","release","compression","expansion","contraction","oscillation","vibration","pulsation","undulation","fluctuation",
 "accumulation","erosion","saturation","depletion","renewal","regeneration","decomposition","fermentation","crystallization","dissolution",
@@ -487,13 +536,7 @@ const VOCAB = [
 const STOP = new Set("i me my we our you your he she it they them the a an and or but in on at to for of is am are was were be been being have has had do does did will would shall should can could may might must not no nor so if then than that this these those what which who whom how when where why all each every some any few many much more most other another such".split(" "));
 
 // ═══════════════════════════════════════════════════════════════
-// BPE ENCODER — text to subword token IDs (2048-token vocabulary)
-//
-// 1792 merges learned from 2.3MB of English text.
-// Byte-level: initial tokens are ASCII codepoints (0-255),
-// merges produce tokens 256-2047.
-//
-// bpeEncode(text) → array of BPE token IDs
+// BPE ENCODER
 // ═══════════════════════════════════════════════════════════════
 
 const BPE_VOCAB = 2048;
@@ -510,7 +553,6 @@ function bpeEncode(text) {
     seq.push(lower.charCodeAt(i));
   }
   let len = seq.length;
-
   for (let m = 0; m < BPE_MERGES; m++) {
     const left = BPE_TABLE[m][0];
     const right = BPE_TABLE[m][1];
@@ -529,10 +571,52 @@ function bpeEncode(text) {
   return seq.slice(0, len);
 }
 
-// ── Precomputed BPE encoding of each vocab word (for generation) ──
+// ── BPE DECODE TABLE ──
+const bpeStrs = new Array(BPE_VOCAB).fill('');
+const bpeStrLen = new Array(BPE_VOCAB).fill(0);
+(function initBpeDecode() {
+  for (let i = 0; i < 256; i++) {
+    bpeStrs[i] = String.fromCharCode(i);
+    bpeStrLen[i] = 1;
+  }
+  for (let m = 0; m < BPE_MERGES; m++) {
+    const id = 256 + m;
+    const left = BPE_TABLE[m][0];
+    const right = BPE_TABLE[m][1];
+    bpeStrs[id] = bpeStrs[left] + bpeStrs[right];
+    bpeStrLen[id] = bpeStrs[id].length;
+  }
+})();
+
+// Precomputed BPE encoding of each vocab word
 const vocabBpe = VOCAB.map(w => bpeEncode(w));
 
-// ── Suffix stripping + greedy match (fallback for OOV input words) ──
+// ── EXTENDED VOCAB ──
+// Hardcoded 1984 words + BPE tokens that decode to whole words (min 3 chars, no stops, no suffixes)
+const SUFFIX_FRAGMENTS = new Set(["ing","tion","ment","ness","ble","ful","ous","ive","ent","ant","ist","ity","ght","est","ter","ther","ted","ting","ally","ling"]);
+
+const extVocab = []; // {word, bpeIds, fromHardcoded}
+(function initExtVocab() {
+  // 1. All 1984 hardcoded words
+  for (let i = 0; i < NWORDS; i++) {
+    extVocab.push({ word: VOCAB[i], bpeIds: vocabBpe[i], fromHardcoded: true });
+  }
+  // 2. BPE tokens that decode to whole alpha words
+  const extSet = new Set(VOCAB);
+  for (let t = 0; t < BPE_VOCAB; t++) {
+    const s = bpeStrs[t];
+    if (s.length < 3) continue;
+    if (!/^[a-zA-Z]+$/.test(s)) continue;
+    const lower = s.toLowerCase();
+    if (extSet.has(lower)) continue;
+    if (STOP.has(lower)) continue;
+    if (SUFFIX_FRAGMENTS.has(lower)) continue;
+    extSet.add(lower);
+    extVocab.push({ word: lower, bpeIds: [t], fromHardcoded: false });
+  }
+})();
+
+// ── Suffix stripping + greedy match ──
 const SUFFIXES = [
   "ting","ning","ring","ling","ding","ping","bing","ging","ming","king",
   "sing","zing",
@@ -612,26 +696,295 @@ function tokenizeText(text) {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// RESONANCE ENGINE — 8-layer transformer (JS implementation)
+//
+// Matches penelope.c v7 forward pass exactly:
+//   RMSNorm, RoPE, multi-head causal self-attention,
+//   RRPRAM resonance with gated blend, SwiGLU FFN
+// ═══════════════════════════════════════════════════════════════
+
+let model = null; // null = field mode, object = trained mode
+
+function silu(x) {
+  return x > -20.0 ? x / (1.0 + Math.exp(-x)) : 0.0;
+}
+
+function rmsnorm(x, g, n) {
+  let ss = 0;
+  for (let i = 0; i < n; i++) ss += x[i] * x[i];
+  ss = ss / n + 1e-5;
+  const inv = 1.0 / Math.sqrt(ss);
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) out[i] = g[i] * x[i] * inv;
+  return out;
+}
+
+function matmulMV(W, x, rows, cols) {
+  // W[rows * cols] @ x[cols] -> out[rows]
+  const out = new Float32Array(rows);
+  for (let i = 0; i < rows; i++) {
+    let s = 0;
+    const off = i * cols;
+    for (let j = 0; j < cols; j++) s += W[off + j] * x[j];
+    out[i] = s;
+  }
+  return out;
+}
+
+function applyRope(q, k, seqLen, nHeads, headDim) {
+  const thetaBase = 10000.0;
+  for (let t = 0; t < seqLen; t++) {
+    for (let h = 0; h < nHeads; h++) {
+      const base = (t * nHeads + h) * headDim;
+      for (let d = 0; d < headDim / 2; d++) {
+        const freq = 1.0 / Math.pow(thetaBase, 2.0 * d / headDim);
+        const cosF = Math.cos(t * freq);
+        const sinF = Math.sin(t * freq);
+        // rotate q
+        const q0 = q[base + d], q1 = q[base + d + headDim / 2];
+        q[base + d] = q0 * cosF - q1 * sinF;
+        q[base + d + headDim / 2] = q0 * sinF + q1 * cosF;
+        // rotate k
+        const k0 = k[base + d], k1 = k[base + d + headDim / 2];
+        k[base + d] = k0 * cosF - k1 * sinF;
+        k[base + d + headDim / 2] = k0 * sinF + k1 * cosF;
+      }
+    }
+  }
+}
+
+// Full forward pass: bpeIds[seqLen] -> logits[BPE_VOCAB]
+function forward(m, bpeIds) {
+  let S = bpeIds.length;
+  if (S < 1) S = 1;
+  if (S > MAX_SEQ) S = MAX_SEQ;
+
+  // x: residual stream [S * DIM]
+  const x = new Float32Array(S * DIM);
+  // embed: tok_emb + pos_emb
+  for (let t = 0; t < S; t++) {
+    let tok = bpeIds[t];
+    if (tok < 0 || tok >= BPE_VOCAB) tok = 0;
+    for (let d = 0; d < DIM; d++)
+      x[t * DIM + d] = m.tok_emb[tok * DIM + d] + m.pos_emb[t * DIM + d];
+  }
+
+  for (let l = 0; l < N_LAYERS; l++) {
+    const lw = m.layers[l];
+
+    // 1. h = rmsnorm(x, attn_norm) per position
+    const h = new Float32Array(S * DIM);
+    for (let t = 0; t < S; t++) {
+      const xSlice = x.subarray(t * DIM, (t + 1) * DIM);
+      const normed = rmsnorm(xSlice, lw.attn_norm, DIM);
+      h.set(normed, t * DIM);
+    }
+
+    // 2. q, k, v projections per position
+    const q = new Float32Array(S * DIM);
+    const k = new Float32Array(S * DIM);
+    const v = new Float32Array(S * DIM);
+    for (let t = 0; t < S; t++) {
+      const ht = h.subarray(t * DIM, (t + 1) * DIM);
+      q.set(matmulMV(lw.wq, ht, DIM, DIM), t * DIM);
+      k.set(matmulMV(lw.wk, ht, DIM, DIM), t * DIM);
+      v.set(matmulMV(lw.wv, ht, DIM, DIM), t * DIM);
+    }
+
+    // 3. RoPE
+    applyRope(q, k, S, N_HEADS, HEAD_DIM);
+
+    // 4. Multi-head causal attention
+    const scale = 1.0 / Math.sqrt(HEAD_DIM);
+    const av = new Float32Array(S * DIM); // attention output
+
+    for (let hd = 0; hd < N_HEADS; hd++) {
+      for (let ti = 0; ti < S; ti++) {
+        const qiBase = (ti * N_HEADS + hd) * HEAD_DIM;
+        // compute scores
+        const scores = new Float32Array(ti + 1);
+        let maxs = -1e30;
+        for (let tj = 0; tj <= ti; tj++) {
+          const kjBase = (tj * N_HEADS + hd) * HEAD_DIM;
+          let dot = 0;
+          for (let d = 0; d < HEAD_DIM; d++) dot += q[qiBase + d] * k[kjBase + d];
+          dot *= scale;
+          scores[tj] = dot;
+          if (dot > maxs) maxs = dot;
+        }
+        // softmax
+        let sum = 0;
+        for (let tj = 0; tj <= ti; tj++) {
+          scores[tj] = Math.exp(scores[tj] - maxs);
+          sum += scores[tj];
+        }
+        const invS = sum > 0 ? 1.0 / sum : 0;
+        for (let tj = 0; tj <= ti; tj++) scores[tj] *= invS;
+
+        // weighted sum of values
+        const aviBase = (ti * N_HEADS + hd) * HEAD_DIM;
+        for (let tj = 0; tj <= ti; tj++) {
+          const a = scores[tj];
+          if (a === 0) continue;
+          const vjBase = (tj * N_HEADS + hd) * HEAD_DIM;
+          for (let d = 0; d < HEAD_DIM; d++) av[aviBase + d] += a * v[vjBase + d];
+        }
+      }
+    }
+
+    // 5. Project through wo
+    const qkvOut = new Float32Array(S * DIM);
+    for (let t = 0; t < S; t++) {
+      const avt = av.subarray(t * DIM, (t + 1) * DIM);
+      qkvOut.set(matmulMV(lw.wo, avt, DIM, DIM), t * DIM);
+    }
+
+    // 6. RRPRAM resonance: rrp = h @ wr
+    const rrp = new Float32Array(S * DIM);
+    for (let t = 0; t < S; t++) {
+      const ht = h.subarray(t * DIM, (t + 1) * DIM);
+      rrp.set(matmulMV(lw.wr, ht, DIM, DIM), t * DIM);
+    }
+
+    // 7. Gated blend: softmax(gate[0], gate[1])
+    const g0 = lw.gate[0], g1 = lw.gate[1];
+    const gmax = Math.max(g0, g1);
+    const e0 = Math.exp(g0 - gmax), e1 = Math.exp(g1 - gmax);
+    const gsum = e0 + e1;
+    const w0 = e0 / gsum, w1 = e1 / gsum;
+
+    // 8. Residual: x = x + w0*qkvOut + w1*rrp
+    for (let i = 0; i < S * DIM; i++)
+      x[i] += w0 * qkvOut[i] + w1 * rrp[i];
+
+    // 9. h2 = rmsnorm(x, ffn_norm)
+    const h2 = new Float32Array(S * DIM);
+    for (let t = 0; t < S; t++) {
+      const xt = x.subarray(t * DIM, (t + 1) * DIM);
+      h2.set(rmsnorm(xt, lw.ffn_norm, DIM), t * DIM);
+    }
+
+    // 10. SwiGLU FFN: x = x + w_down @ (silu(h2 @ w_gate) * (h2 @ w_up))
+    for (let t = 0; t < S; t++) {
+      const h2t = h2.subarray(t * DIM, (t + 1) * DIM);
+      const fg = matmulMV(lw.w_gate, h2t, HDIM, DIM);
+      const fu = matmulMV(lw.w_up, h2t, HDIM, DIM);
+      const sw = new Float32Array(HDIM);
+      for (let i = 0; i < HDIM; i++) sw[i] = silu(fg[i]) * fu[i];
+      const fd = matmulMV(lw.w_down, sw, DIM, HDIM);
+      for (let d = 0; d < DIM; d++) x[t * DIM + d] += fd[d];
+    }
+  }
+
+  // Final: rmsnorm(x[last], final_norm) @ lm_head^T
+  const xLast = x.subarray((S - 1) * DIM, S * DIM);
+  const xn = rmsnorm(xLast, m.final_norm, DIM);
+  const logits = matmulMV(m.lm_head, xn, BPE_VOCAB, DIM);
+  return logits;
+}
+
+// BPE logits -> word scores (mean aggregation)
+function bpeLogitsToWordScores(bpeLogits) {
+  const scores = new Float32Array(extVocab.length);
+  for (let w = 0; w < extVocab.length; w++) {
+    const ew = extVocab[w];
+    const bl = ew.bpeIds.length;
+    let s = 0;
+    for (let b = 0; b < bl; b++) {
+      const tok = ew.bpeIds[b];
+      if (tok >= 0 && tok < BPE_VOCAB) s += bpeLogits[tok];
+    }
+    scores[w] = bl > 0 ? s / bl : 0;
+  }
+  return scores;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PEN7 BINARY WEIGHT LOADING
+//
+// Format: 32-byte header (8 int32s) + float32 weights
+// Header: [magic=0x50454E37, BPE_VOCAB, NWORDS, DIM, HDIM, N_HEADS, N_LAYERS, MAX_SEQ]
+// ═══════════════════════════════════════════════════════════════
+
+async function loadWeightsPEN7(buffer) {
+  const headerView = new DataView(buffer, 0, 32);
+  const magic = headerView.getInt32(0, true);
+  if (magic !== 0x50454E37) {
+    throw new Error('Not a PEN7 file (magic=0x' + magic.toString(16) + ')');
+  }
+  const hBpeVocab = headerView.getInt32(4, true);
+  const hNWords = headerView.getInt32(8, true);
+  const hDim = headerView.getInt32(12, true);
+  const hHDim = headerView.getInt32(16, true);
+  const hNHeads = headerView.getInt32(20, true);
+  const hNLayers = headerView.getInt32(24, true);
+  const hMaxSeq = headerView.getInt32(28, true);
+
+  if (hBpeVocab !== BPE_VOCAB || hNWords !== NWORDS || hDim !== DIM ||
+      hHDim !== HDIM || hNHeads !== N_HEADS || hNLayers !== N_LAYERS || hMaxSeq !== MAX_SEQ) {
+    throw new Error('Config mismatch: BV=' + hBpeVocab + ' V=' + hNWords +
+      ' D=' + hDim + ' H=' + hHDim + ' NH=' + hNHeads + ' NL=' + hNLayers + ' S=' + hMaxSeq);
+  }
+
+  const floats = new Float32Array(buffer, 32);
+  let offset = 0;
+
+  function readFloats(n) {
+    const arr = new Float32Array(n);
+    arr.set(floats.subarray(offset, offset + n));
+    offset += n;
+    return arr;
+  }
+
+  const m = {};
+  m.tok_emb = readFloats(BPE_VOCAB * DIM);
+  m.pos_emb = readFloats(MAX_SEQ * DIM);
+  m.final_norm = readFloats(DIM);
+  m.lm_head = readFloats(BPE_VOCAB * DIM);
+
+  m.layers = [];
+  for (let l = 0; l < N_LAYERS; l++) {
+    const lw = {};
+    lw.attn_norm = readFloats(DIM);
+    lw.wq = readFloats(DIM * DIM);
+    lw.wk = readFloats(DIM * DIM);
+    lw.wv = readFloats(DIM * DIM);
+    lw.wo = readFloats(DIM * DIM);
+    lw.wr = readFloats(DIM * DIM);
+    lw.gate = readFloats(2);
+    lw.ffn_norm = readFloats(DIM);
+    lw.w_gate = readFloats(DIM * HDIM);
+    lw.w_up = readFloats(DIM * HDIM);
+    lw.w_down = readFloats(HDIM * DIM);
+    m.layers.push(lw);
+  }
+
+  const totalParams = offset;
+  console.log('PEN7 loaded: ' + totalParams + ' params (' + (totalParams * 4 / 1e6).toFixed(1) + 'MB)');
+  return m;
+}
+
+// ═══════════════════════════════════════════════════════════════
 // DARIO FIELD — co-occurrence, prophecy, destiny, trauma
 // ═══════════════════════════════════════════════════════════════
 
-const cooc = new Map(); // "word1|word2" → count
-const bigrams = new Map(); // "word" → Map(next → count)
-let destiny = new Array(8).fill(0); // semantic compass (category buckets)
+const cooc = new Map();
+const bigrams = new Map();
+let destiny = new Array(8).fill(0);
 let trauma = 0;
 let prophecyTarget = null;
 let prophecyAge = 0;
 let totalSteps = 0;
 
 function wordCategory(idx) {
-  if (idx < 100) return 0; // body
-  if (idx < 200) return 1; // nature
-  if (idx < 300) return 2; // emotion
-  if (idx < 350) return 3; // time
-  if (idx < 450) return 4; // society
-  if (idx < 550) return 5; // abstract
-  if (idx < 650) return 6; // action
-  return 7; // everything else
+  if (idx < 100) return 0;
+  if (idx < 200) return 1;
+  if (idx < 300) return 2;
+  if (idx < 350) return 3;
+  if (idx < 450) return 4;
+  if (idx < 550) return 5;
+  if (idx < 650) return 6;
+  return 7;
 }
 
 function updateCooc(w1, w2) {
@@ -655,16 +1008,14 @@ const chambers = { fear:0, love:0, rage:0, void_:0, flow:0, complex:0 };
 const chamberDecay = { fear:0.95, love:0.95, rage:0.93, void_:0.96, flow:0.94, complex:0.97 };
 
 function updateChambers(stepIdx) {
-  // excite based on step depth (3 phases: surface/depth/bone)
   const depth = stepIdx / STEPS;
   const phase = depth < 0.33 ? 0 : depth < 0.66 ? 1 : 2;
-  if (phase === 0) chambers.flow += 0.05;       // surface: curiosity
-  if (phase === 1) chambers.fear += 0.04;        // depth: tension builds
-  if (phase === 2) chambers.void_ += 0.05;       // bone: the abyss
-  if (depth > 0.75) chambers.complex += 0.03;    // final quarter: complexity
+  if (phase === 0) chambers.flow += 0.05;
+  if (phase === 1) chambers.fear += 0.04;
+  if (phase === 2) chambers.void_ += 0.05;
+  if (depth > 0.75) chambers.complex += 0.03;
   if (trauma > 0.3) chambers.rage += 0.04;
 
-  // Kuramoto coupling
   const K = 0.02;
   const names = Object.keys(chambers);
   const old = {...chambers};
@@ -672,7 +1023,6 @@ function updateChambers(stepIdx) {
     for (const j of names)
       if (i !== j) chambers[i] += K * Math.sin(old[j] - old[i]);
 
-  // decay
   for (const k of names) {
     chambers[k] *= chamberDecay[k] || 0.95;
     chambers[k] = Math.max(0, Math.min(1, chambers[k]));
@@ -680,33 +1030,23 @@ function updateChambers(stepIdx) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// DARIO EQUATION — the selection mechanism
-//
-// score(w) = B + α·H + β·F + γ·A + T
-//   B = bigram affinity with previous word
-//   H = Hebbian co-occurrence with context
-//   F = prophecy fulfillment pressure
-//   A = destiny attraction
-//   T = trauma gravity (pulls toward deep words)
+// DARIO EQUATION — selection mechanism (field mode)
 // ═══════════════════════════════════════════════════════════════
 
 function darioScore(candidate, context, prevWord, stepIdx) {
   const cidx = VOCAB.indexOf(candidate);
   if (cidx < 0) return -Infinity;
 
-  // somatic modulation from chambers
   const alpha_mod = 1 + 0.3*chambers.love - 0.2*chambers.rage + 0.1*chambers.flow;
   const beta_mod = 1 + 0.2*chambers.flow - 0.3*chambers.fear;
   const gamma_mod = 1 + 0.4*chambers.void_ + 0.2*chambers.complex;
 
-  // B: bigram
   let B = 0;
   if (prevWord && bigrams.has(prevWord)) {
     const m = bigrams.get(prevWord);
     B = (m.get(candidate) || 0) / (Math.max(...m.values()) + 1);
   }
 
-  // H: Hebbian co-occurrence with full context
   let H = 0;
   for (const ctx of context) {
     H += getCooc(ctx, candidate) * (1 / (context.length - context.indexOf(ctx) + 1));
@@ -714,67 +1054,80 @@ function darioScore(candidate, context, prevWord, stepIdx) {
   const h_max = Math.max(H, 1);
   H /= h_max;
 
-  // F: prophecy fulfillment
   let F = 0;
   if (prophecyTarget && candidate === prophecyTarget) {
     F = 0.5 * Math.log(1 + prophecyAge);
   }
 
-  // A: destiny attraction (category alignment)
   const cat = wordCategory(cidx);
   let A = destiny[cat] / (Math.max(...destiny.map(Math.abs)) + 0.01);
 
-  // T: trauma (deeper words in later steps)
   let T = 0;
   if (trauma > 0.3 && stepIdx > 6) {
-    // emotional and philosophical words get trauma boost
     if (cidx >= 200 && cidx < 300) T = trauma * 1.5;
     if (cidx >= 450 && cidx < 550) T = trauma * 1.2;
     if (cidx >= 930 && cidx < 1000) T = trauma * 1.0;
   }
 
-  // wormhole: occasional category jump
   let wormhole = 0;
   if (Math.random() < 0.08 && stepIdx > 3 && stepIdx < 10) {
-    // jump to unexpected category
     const jumpCat = Math.floor(Math.random() * 8);
     if (cat === jumpCat) wormhole = 0.5;
   }
 
-  // step-specific vibe modulation (3 phases × 4 steps)
-  // Phase 1 (surface): bright, exploratory
-  // Phase 2 (depth): heavy, directed
-  // Phase 3 (bone): sharp, final
-  const vibes = [1.3, 1.1, 1.0, 0.9,  0.8, 0.7, 0.8, 0.9,  1.0, 0.8, 0.7, 1.4];
+  const vibes = [1.3, 1.1, 1.0, 0.9, 0.8, 0.7, 0.8, 0.9, 1.0, 0.8, 0.7, 1.4];
   const vibe = vibes[stepIdx] || 1.0;
-
-  // temperature from depth
   const tau = 0.7 + stepIdx * 0.08;
 
   const score = (B * 8 + alpha_mod * 0.3 * H + beta_mod * 0.15 * F +
                  gamma_mod * 0.25 * A + T + wormhole) * vibe / tau;
-
   return score;
 }
 
+// Dario overlay for trained mode: adds field scores on top of transformer word scores
+function darioOverlay(wordScores, context, step) {
+  const alpha_mod = 1 + 0.3*chambers.love - 0.2*chambers.rage + 0.1*chambers.flow;
+  const gamma_mod = 1 + 0.4*chambers.void_ + 0.2*chambers.complex;
+
+  const lastN = Math.min(context.length, 8);
+  const start = context.length - lastN;
+
+  for (let v = 0; v < NWORDS; v++) {
+    // H: Hebbian
+    let H = 0;
+    for (let i = start; i < context.length; i++)
+      H += getCooc(VOCAB[context[i]], VOCAB[v]);
+    if (H > 1) H = 1;
+    wordScores[v] += alpha_mod * 0.3 * H;
+
+    // F: prophecy
+    if (prophecyTarget && VOCAB[v] === prophecyTarget)
+      wordScores[v] += 0.5 * Math.log(1.0 + prophecyAge);
+
+    // A: destiny
+    const cat = wordCategory(v);
+    let dMax = 0.01;
+    for (let i = 0; i < 8; i++) if (Math.abs(destiny[i]) > dMax) dMax = Math.abs(destiny[i]);
+    wordScores[v] += gamma_mod * 0.25 * destiny[cat] / dMax;
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════
-// SELECT WORD — Dario equation + diversity + no-repeat
+// SELECT WORD — field mode (Dario-only)
 // ═══════════════════════════════════════════════════════════════
 
-function selectWord(context, prevWord, stepIdx, forbidden) {
+function selectWordField(context, prevWord, stepIdx, forbidden) {
   const scores = [];
   for (const w of VOCAB) {
     if (forbidden.has(w)) continue;
     scores.push({ word: w, score: darioScore(w, context, prevWord, stepIdx) });
   }
 
-  // add randomness weighted by step (early = more random, late = more directed)
   const noise = 0.3 * (1 - stepIdx / STEPS);
   for (const s of scores) s.score += Math.random() * noise;
 
   scores.sort((a, b) => b.score - a.score);
 
-  // top-k sampling (k=12)
   const k = Math.min(12, scores.length);
   const topk = scores.slice(0, k);
   const sum = topk.reduce((s, x) => s + Math.max(0, x.score), 0.001);
@@ -787,53 +1140,79 @@ function selectWord(context, prevWord, stepIdx, forbidden) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// EXTRACT KEY WORD — BPE tokenize input, return best vocab word
+// SELECT WORD — trained mode (transformer forward + Dario overlay)
+// ═══════════════════════════════════════════════════════════════
+
+function selectWordTrained(bpeBuf, contextIds, stepIdx, forbidden) {
+  // Full transformer forward on BPE buffer
+  const ids = bpeBuf.length > MAX_SEQ ? bpeBuf.slice(bpeBuf.length - MAX_SEQ) : bpeBuf;
+  const bpeLogits = forward(model, ids);
+
+  // BPE logits -> word scores for extended vocab
+  const wordScores = bpeLogitsToWordScores(bpeLogits);
+
+  // Apply Dario overlay on the NWORDS portion
+  darioOverlay(wordScores, contextIds, stepIdx);
+
+  // Filter forbidden, pick from extVocab (prefer hardcoded 1984)
+  const candidates = [];
+  for (let i = 0; i < extVocab.length; i++) {
+    const ew = extVocab[i];
+    if (forbidden.has(ew.word)) continue;
+    candidates.push({ word: ew.word, score: wordScores[i], idx: i });
+  }
+
+  // top-k sampling
+  candidates.sort((a, b) => b.score - a.score);
+  const k = Math.min(16, candidates.length);
+  const topk = candidates.slice(0, k);
+
+  // softmax over top-k
+  let maxScore = topk[0].score;
+  let sumExp = 0;
+  for (const t of topk) {
+    t.prob = Math.exp(t.score - maxScore);
+    sumExp += t.prob;
+  }
+  for (const t of topk) t.prob /= sumExp;
+
+  // sample
+  let r = Math.random();
+  for (const t of topk) {
+    r -= t.prob;
+    if (r <= 0) return t.word;
+  }
+  return topk[0].word;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// EXTRACT KEY + PROPHECY
 // ═══════════════════════════════════════════════════════════════
 
 function extractKey(text) {
   const ids = tokenizeText(text);
   if (ids.length > 0) return VOCAB[ids[0]];
-  // fallback: longest non-stop word
   const words = text.toLowerCase().replace(/[^a-z\s]/g, '').split(/\s+/).filter(w => w.length > 1 && !STOP.has(w));
   if (words.length === 0) return text.toLowerCase().split(/\s+/)[0] || "silence";
   words.sort((a, b) => b.length - a.length);
   return words[0];
 }
 
-// ═══════════════════════════════════════════════════════════════
-// PROPHECY — what Penelope predicts before the chain starts
-// ═══════════════════════════════════════════════════════════════
-
 function makeProphecy(seedWord) {
-  // predict the final word based on seed category
   const idx = VOCAB.indexOf(seedWord);
   let cat = idx >= 0 ? wordCategory(idx) : 5;
-
-  // prophecy tends toward depth: emotion, abstract, philosophy
-  const deepCats = [2, 5, 7]; // emotion, abstract, other
+  const deepCats = [2, 5, 7];
   const targetCat = deepCats[Math.floor(Math.random() * deepCats.length)];
   const catStart = [0,100,200,300,350,450,550,650][targetCat] || 450;
   const catEnd = [100,200,300,350,450,550,650,1984][targetCat] || 550;
   const target = VOCAB[catStart + Math.floor(Math.random() * (catEnd - catStart))];
-
   prophecyTarget = target;
   prophecyAge = 0;
   return target;
 }
 
 // ═══════════════════════════════════════════════════════════════
-// RUN CHAIN — 12 steps of resonance
-//
-// Architecture (mirrors penelope.c):
-//   embedIn[BPE_VOCAB * DIM] — input BPE embedding (2048 × 384)
-//   embedOut[NWORDS * DIM]   — output word embedding (1984 × 384)
-//   poolContext: mean-pool embedIn over BPE token IDs
-//   forward: logits = (query + hidden) @ embedOut^T
-//   Dario Field overlay on top of learned logits
-//
-// Without trained weights, the Dario Field IS the selection
-// mechanism. The BPE buffer tracks subword context identically
-// to the C engine for future weight loading.
+// RUN CHAIN
 // ═══════════════════════════════════════════════════════════════
 
 async function runChain(userText) {
@@ -846,9 +1225,11 @@ async function runChain(userText) {
   prophecyEl.classList.remove('visible');
   if (waiting) waiting.style.display = 'none';
 
-  // BPE tokenize input — real byte-pair encoding (2048 subword tokens)
-  const inputBpe = bpeEncode(userText);  // subword BPE IDs for embedIn context
-  const inputIds = tokenizeText(userText); // word-level IDs for Dario Field
+  const trained = model !== null;
+
+  // BPE tokenize input
+  const inputBpe = bpeEncode(userText);
+  const inputIds = tokenizeText(userText);
   const inputWords = new Set(userText.toLowerCase().replace(/[^a-z\s]/g,'').split(/\s+/));
 
   // seed = first word-level token, or fallback
@@ -856,7 +1237,6 @@ async function runChain(userText) {
   if (inputIds.length > 0) {
     seed = VOCAB[inputIds[0]];
   } else {
-    // last resort: substring/prefix match
     const keyWord = extractKey(userText);
     seed = keyWord;
     if (!VOCAB.includes(seed)) {
@@ -875,26 +1255,26 @@ async function runChain(userText) {
     }
   }
 
-  // prime Hebbian field with all input tokens
+  // prime Hebbian field
   for (let i = 1; i < inputIds.length; i++) {
     updateCooc(VOCAB[inputIds[i - 1]], VOCAB[inputIds[i]]);
   }
 
   // prophecy
   const prophesied = makeProphecy(seed);
-  prophecyEl.textContent = `destined: ${prophesied}`;
+  prophecyEl.textContent = 'destined: ' + prophesied;
   setTimeout(() => prophecyEl.classList.add('visible'), 300);
 
-  // forbidden: input words + seed (no repetition)
+  // forbidden
   const forbidden = new Set([...inputWords, seed]);
 
   // show seed
   await showWord(column, seed, 'seed', 0);
 
-  // BPE buffer — accumulates subword tokens for poolContext(embedIn)
-  // mirrors penelope.c: bpe_buf starts with seed's BPE, grows each step
+  // BPE buffer
   const seedIdx = VOCAB.indexOf(seed);
   let bpeBuf = seedIdx >= 0 ? [...vocabBpe[seedIdx]] : [...inputBpe];
+  let contextIds = seedIdx >= 0 ? [seedIdx] : [...inputIds];
 
   // 12 steps
   const chain = [seed];
@@ -902,12 +1282,18 @@ async function runChain(userText) {
   let totalDebt = 0;
 
   for (let step = 0; step < STEPS; step++) {
-    await sleep(1200 + step * 150); // slow suspense — each step heavier than the last
+    await sleep(1200 + step * 150);
 
     updateChambers(step);
     prophecyAge++;
 
-    const word = selectWord(chain, prevWord, step, forbidden);
+    let word;
+    if (trained) {
+      word = selectWordTrained(bpeBuf, contextIds, step, forbidden);
+    } else {
+      word = selectWordField(chain, prevWord, step, forbidden);
+    }
+
     chain.push(word);
     forbidden.add(word);
 
@@ -918,6 +1304,7 @@ async function runChain(userText) {
     if (widx >= 0) {
       const cat = wordCategory(widx);
       destiny[cat] = 0.3 * 1 + 0.7 * destiny[cat];
+      contextIds.push(widx);
     }
 
     // prophecy debt
@@ -927,14 +1314,20 @@ async function runChain(userText) {
       totalDebt = Math.max(0, totalDebt - 1);
     }
 
-    // trauma from depth
+    // trauma
     if (step > 7) trauma = Math.min(1, trauma + 0.1);
     trauma *= 0.97;
 
-    // append picked word's BPE tokens to buffer (mirrors penelope.c forward)
+    // append BPE tokens
     const pickIdx = VOCAB.indexOf(word);
     if (pickIdx >= 0 && bpeBuf.length + vocabBpe[pickIdx].length < 8192) {
       bpeBuf.push(...vocabBpe[pickIdx]);
+    } else {
+      // extended vocab word — look it up
+      const extIdx = extVocab.findIndex(e => e.word === word);
+      if (extIdx >= 0 && bpeBuf.length + extVocab[extIdx].bpeIds.length < 8192) {
+        bpeBuf.push(...extVocab[extIdx].bpeIds);
+      }
     }
 
     // ingest into field
@@ -949,37 +1342,73 @@ async function runChain(userText) {
 
   totalSteps += STEPS;
 
-  // check if prophecy fulfilled
+  // check prophecy
   const fulfilled = chain.includes(prophecyTarget);
 
-  // show metrics
+  // metrics
   await sleep(600);
   const cats = chain.map(w => wordCategory(VOCAB.indexOf(w))).filter(c => c >= 0);
   const uniqueCats = new Set(cats).size;
-  metrics.innerHTML = `debt ${totalDebt.toFixed(2)} · resonance ${(cooc.size/100).toFixed(2)} · drift ${uniqueCats}/8 · bpe ${bpeBuf.length} · prophecy ${fulfilled ? 'fulfilled' : 'unfulfilled'}`;
+  const modeStr = trained ? 'resonance' : 'field';
+  metrics.innerHTML = 'mode ' + modeStr + ' · debt ' + totalDebt.toFixed(2) +
+    ' · drift ' + uniqueCats + '/8 · bpe ' + bpeBuf.length +
+    ' · prophecy ' + (fulfilled ? 'fulfilled' : 'unfulfilled');
   metrics.classList.add('visible');
 
-  // update prophecy display
   if (fulfilled) {
-    prophecyEl.textContent = `destined: ${prophesied} ✓`;
+    prophecyEl.textContent = 'destined: ' + prophesied + ' \u2713';
   } else {
-    prophecyEl.textContent = `destined: ${prophesied} — unfulfilled`;
+    prophecyEl.textContent = 'destined: ' + prophesied + ' \u2014 unfulfilled';
   }
 }
 
 function showWord(container, word, cls, stepNum) {
   return new Promise(resolve => {
     const div = document.createElement('div');
-    div.className = `word-line ${cls}`;
+    div.className = 'word-line ' + cls;
     div.textContent = word;
     container.appendChild(div);
-    // scroll into view smoothly
     div.scrollIntoView({ behavior: 'smooth', block: 'end' });
     setTimeout(resolve, 100);
   });
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// ═══════════════════════════════════════════════════════════════
+// WEIGHT LOADING UI
+// ═══════════════════════════════════════════════════════════════
+
+const weightFileInput = document.getElementById('weight-file');
+const loadWeightsBtn = document.getElementById('load-weights-btn');
+const modeIndicator = document.getElementById('mode-indicator');
+
+loadWeightsBtn.addEventListener('click', () => {
+  weightFileInput.click();
+});
+
+weightFileInput.addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  loadWeightsBtn.textContent = 'loading...';
+  loadWeightsBtn.disabled = true;
+  try {
+    const buffer = await file.arrayBuffer();
+    model = await loadWeightsPEN7(buffer);
+    modeIndicator.textContent = 'resonance';
+    modeIndicator.classList.add('trained');
+    loadWeightsBtn.textContent = 'weights loaded';
+    loadWeightsBtn.style.color = '#4a7c59';
+    loadWeightsBtn.style.borderColor = '#4a7c59';
+    document.getElementById('eight').textContent = 'v7';
+  } catch (err) {
+    console.error('Weight load error:', err);
+    loadWeightsBtn.textContent = 'error: ' + err.message;
+    loadWeightsBtn.style.color = '#c44';
+    loadWeightsBtn.disabled = false;
+    model = null;
+  }
+});
 
 // ═══════════════════════════════════════════════════════════════
 // INPUT
