@@ -53,23 +53,63 @@ Where B is bigram affinity, H is Hebbian co-occurrence, F is prophecy fulfillmen
 
 ### Examples
 
+Trained mode:
+
 ```
 "darkness eats the city"
-
 darkness → fog → hawk → brass → candle → burn → sing → landing → sand → raft → loss → boat
-```
 
-```
 "what is consciousness"
-
 consciousness → ash → prisoner → moss → island → hero → ink → sowing → fog → oar → salt → seed
 ```
 
-```
-"love"
+Weightless mode (no training, Dario Field only):
 
-love → habit → sand → chain → sled → orbit → butter → mesh → meteorite → horse → candle → burn
-```
+**"love"** — destined: entropy — unfulfilled
+
+<p align="center">
+  <img src="assets/demo_love.png" width="520" />
+</p>
+
+> love → create → push → remember → hide → delay → vibration → gravity → comfort → basalt → shapeshifter → scatter → **abandon**
+
+**"hello"** — destined: story — unfulfilled
+
+<p align="center">
+  <img src="assets/demo_hello.png" width="520" />
+</p>
+
+> helix → bend → remember → carry → hide → delay → wedding → enmeshment → sonata → decryption → master → fascination → **triumph**
+
+**"Penelope"** — destined: longing — unfulfilled
+
+<p align="center">
+  <img src="assets/demo_penelope.png" width="520" />
+</p>
+
+> pen → study → pyramid → hoard → sacrifice → healer → certainty → screw → ambivalence → intimacy → yearning → delight → **disgust**
+
+She hears her own name and walks from pen to disgust through sacrifice and yearning.
+
+**"how are you?"** — destined: blessing — unfulfilled
+
+<p align="center">
+  <img src="assets/demo_howareyou.png" width="520" />
+</p>
+
+> hormone → asteroid → gather → erosion → lock → other → verdict → train → vulnerability → rage → guilt → love → **hatred**
+
+Asked how she's doing, she ends on hatred. Through love.
+
+**"what is the meaning of life?"** — destined: ambivalence — **fulfilled**
+
+<p align="center">
+  <img src="assets/demo_meaning.png" width="520" />
+</p>
+
+> meaning → gem → ambivalence → well → violet → icon → smog → accumulation → intimacy → yearning → certainty → screw → **paranoia**
+
+The only fulfilled prophecy. She was destined for ambivalence — and found it at step 3. Then kept walking anyway, past intimacy and yearning, through certainty, into paranoia.
 
 ## Implementations
 
