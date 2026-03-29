@@ -296,7 +296,28 @@ for _i, _w in enumerate(VOCAB):
 
 STOP = set("i me my we our you your he she it they them the a an and or but in on at to for of is am are was were be been being have has had do does did will would shall should can could may might must not no nor so if then than that this these those what which who whom how when where why all each every some any few many much more most other another such".split())
 
-SUFFIX_FRAGMENTS = {"ing","tion","ment","ness","ble","ful","ous","ive","ent","ant","ist","ity","ght","est","ter","ther","ted","ting","ally","ling"}
+SUFFIX_FRAGMENTS = {
+    # Original morphemes
+    "ing","tion","ment","ness","ble","ful","ous","ive","ent","ant",
+    "ist","ity","ght","est","ter","ther","ted","ting","ally","ling",
+    # Confirmed BPE fragments from cascade output (not English words)
+    "ough","ital","ard","ently","cre","ely","ary","ily","ious",
+    "ation","able","ible","ish","ize","ise","ance","ence","ency",
+    "ancy","ory","ery","ure","edly","erly","enly","ably","ibly",
+    # Short BPE junk seen in output (verified not real words)
+    "ith","ald","ond","und","ung","urg","arn","ulf","olf",
+    "ect","ict","uct","ept","ipt","aft","eft","ift","oft",
+    "ult","olt","ilt","ust","ost","ying",
+}
+
+def _looks_like_fragment(word):
+    """Check if a word looks like a BPE fragment rather than a real word."""
+    if word in SUFFIX_FRAGMENTS:
+        return True
+    vowels = set("aeiou")
+    if not any(c in vowels for c in word):
+        return True
+    return False
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -633,7 +654,7 @@ def init_ext_vocab():
 
     n_hard = NWORDS
     n_bpe = len(ext_vocab) - n_hard
-    print(f"  extended vocab: {len(ext_vocab)} words ({n_hard} hardcoded + {n_bpe} from BPE)")
+    print(f"  extended vocab: {len(ext_vocab)} words ({n_hard} hardcoded + {n_bpe} from BPE)", file=sys.stderr)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -970,7 +991,7 @@ class Penelope:
             n = HDIM * DIM
             lw.w_down = list(struct.unpack_from(f"{n}f", data, o)); o += n * 4
 
-        print(f"  loaded v7 {path}: {self.param_count()} params ({self.param_count() * 4.0 / 1e6:.1f}MB)")
+        print(f"  loaded v7 {path}: {self.param_count()} params ({self.param_count() * 4.0 / 1e6:.1f}MB)", file=sys.stderr)
         return True
 
 
@@ -1316,9 +1337,24 @@ def run_chain(model, field, text, has_weights=False):
                 pick = idx
                 break
 
+        # 5b. Validate: if extended vocab pick looks suspicious, resample from hardcoded
+        pick_name = VOCAB[pick] if pick < NWORDS else ext_vocab[pick][0]
+        if pick >= NWORDS and _looks_like_fragment(pick_name):
+            # Resample from top-k but only hardcoded words (max 3 attempts)
+            hardcoded_candidates = [(idx, p) for idx, p in indexed if idx < NWORDS and VOCAB[idx] not in forbidden_words]
+            if hardcoded_candidates:
+                htotal = sum(max(0, p) for _, p in hardcoded_candidates) + 0.001
+                r2 = random.random() * htotal
+                pick = hardcoded_candidates[0][0]
+                for idx, p in hardcoded_candidates:
+                    r2 -= max(0, p)
+                    if r2 <= 0:
+                        pick = idx
+                        break
+                pick_name = VOCAB[pick]
+
         chain.append(pick)
         forbidden.add(pick)
-        pick_name = VOCAB[pick] if pick < NWORDS else ext_vocab[pick][0]
         forbidden_words.add(pick_name)
 
         # 6. Append picked word's BPE tokens to context
@@ -1388,11 +1424,11 @@ def main():
     field = DarioField()
 
     print()
-    print(f"  penelope v7 \u2014 Resonance engine. 1984 words. Dario Equation.")
-    print(f"  {N_LAYERS} layers, {N_HEADS} heads, dim={DIM}, hdim={HDIM}")
-    print(f"  {model.param_count():,} trainable params ({model.param_count()*4/1e6:.1f}MB f32)")
-    print(f"  BPE input: {BPE_VOCAB} subword tokens, max_seq={MAX_SEQ}")
-    print(f"  by Arianna Method")
+    print(f"  penelope v7 \u2014 Resonance engine. 1984 words. Dario Equation.", file=sys.stderr)
+    print(f"  {N_LAYERS} layers, {N_HEADS} heads, dim={DIM}, hdim={HDIM}", file=sys.stderr)
+    print(f"  {model.param_count():,} trainable params ({model.param_count()*4/1e6:.1f}MB f32)", file=sys.stderr)
+    print(f"  BPE input: {BPE_VOCAB} subword tokens, max_seq={MAX_SEQ}", file=sys.stderr)
+    print(f"  by Arianna Method", file=sys.stderr)
     print()
 
     has_weights = False
@@ -1406,7 +1442,7 @@ def main():
         if save_path:
             model.save(save_path)
 
-    print(f"  mode: {'trained (BPE word scores)' if has_weights else 'weightless (word-level)'}")
+    print(f"  mode: {'trained (BPE word scores)' if has_weights else 'weightless (word-level)'}", file=sys.stderr)
     print()
 
     if text:
